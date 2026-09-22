@@ -271,7 +271,19 @@ class TaskMatch:
 
                 results[orig_doc_idx].append(item_dict)
 
-        return results
+        # Deduplicate per document (keep highest score) and sort descending
+        final_results: List[List[Dict[str, Any]]] = []
+        for doc_matches in results:
+            best_by_task: Dict[str, Dict[str, Any]] = {}
+            for item in doc_matches:
+                t_id = item["task_id"]
+                if t_id not in best_by_task or item["score"] > best_by_task[t_id]["score"]:
+                    best_by_task[t_id] = item
+
+            sorted_matches = sorted(best_by_task.values(), key=lambda x: x["score"], reverse=True)
+            final_results.append(sorted_matches)
+
+        return final_results
 
     def get_tasks(
         self,
