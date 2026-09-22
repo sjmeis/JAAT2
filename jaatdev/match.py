@@ -45,7 +45,7 @@ class TaskMatch:
         query_prefix: str = "",
         document_prefix: str = "",
         initial_top_n: int = 25,
-        threshold: float = 0.50,
+        threshold: float = 0.60,
         cross_temp: float = 1.0,
     ) -> None:
         logger.info("Initializing TaskMatch pipeline...")
