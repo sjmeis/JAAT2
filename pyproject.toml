@@ -9,11 +9,10 @@ description = "Repository for JAAT: efficient and accurate analysis of job ads f
 readme = {file = "README.md", content-type = "text/markdown"}
 license = {file = "LICENSE"}
 authors = [
-  {name = "Stephen Meisenbacher", email = "stephen.meisenbacher@tum.de"},
-  {name = "Peter Norlander", email = "pnorlander@luc.edu"},
+  {name = "Stephen Meisenbacher", email = "sjmeis@gtgd.com"},
 ]
 maintainers = [
-  {name = "Stephen Meisenbacher", email = "stephen.meisenbacher@tum.de"}
+  {name = "Stephen Meisenbacher", email = "sjmeis@gtgd.com"}
 ]
 keywords = ["text analysis", "text classification", "semantic matching"]
 classifiers = [
@@ -36,15 +35,9 @@ dependencies = [
     "huggingface_hub"
 ]
 
-[project.urls]
-Homepage = "https://github.com/Job-Ad-Research-at-QSB-LUC/JAAT"
-Documentation = "https://github.com/Job-Ad-Research-at-QSB-LUC/JAAT"
-Repository = "https://github.com/Job-Ad-Research-at-QSB-LUC/JAAT"
-Issues = "https://github.com/Job-Ad-Research-at-QSB-LUC/JAAT/issues"
-
 [tool.setuptools]
-packages = ["JAAT"]
+packages = ["jaatdev"]
 include-package-data = true
 
 [tool.setuptools.package-data]
-JAAT = ['JAAT/data/*', 'JAAT/models/*']
+jaatdev = ['JAAT/data/*', 'JAAT/models/*']
