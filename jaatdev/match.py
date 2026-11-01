@@ -79,7 +79,7 @@ class Match:
         self.hf_token = hf_token
 
         # Bi-encoder and task embeddings
-        logger.info("Setting up bi-encoder and task corpus...")
+        logger.info("Setting up bi-encoder and taxonomies...")
         self.embedding_model_name = embedding_model
         self.embedding_model = get_shared_model(embedding_model, self.device, token=self.hf_token)
 
@@ -154,7 +154,13 @@ class Match:
             return []
 
         dataset = ListDataset([x[1] for x in all_data])
-        predictions = [r for r in progress_bar(self.pipe(dataset))]
+        predictions = [
+            r for r in progress_bar(
+                self.pipe(dataset),
+                total=len(all_data),
+                desc="Classifying candidate sentences"
+            )
+        ]
 
         return [
             pair for pair, pred in zip(all_data, predictions) 
@@ -192,7 +198,13 @@ class Match:
         use_cuda = "cuda" in str(self.device)
         autocast_dtype = torch.bfloat16 if (use_cuda and torch.cuda.is_bf16_supported()) else torch.float16
 
-        for i in range(0, len(pairs), batch_size):
+        pbar = progress_bar(
+            range(0, len(pairs), batch_size),
+            desc="NLI Verification",
+            total=(len(pairs) + batch_size - 1) // batch_size
+        )
+
+        for i in pbar:
             b_prem = premises[i:i + batch_size]
             b_hypo = hypotheses[i:i + batch_size]
 
@@ -344,7 +356,7 @@ class Match:
             raw_ce_preds = self.cross_encoder.predict(
                 ce_pairs,
                 batch_size=128,
-                show_progress_bar=False,
+                show_progress_bar=GLOBAL_SETTINGS.get("show_progress", True),
                 convert_to_numpy=True
             )
             scaled_scores = 1.0 / (1.0 + np.exp(-(raw_ce_preds + 1.5) / self.cross_temp))
