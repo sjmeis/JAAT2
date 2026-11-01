@@ -78,16 +78,16 @@ class Match:
         self.cross_temp = cross_temp
         self.hf_token = hf_token
 
+        # Bi-encoder and task embeddings
+        logger.info("Setting up bi-encoder and task corpus...")
+        self.embedding_model_name = embedding_model
+        self.embedding_model = get_shared_model(embedding_model, self.device, token=self.hf_token)
+
         self._taxonomies: Dict[str, Taxonomy] = {}
         if default_taxonomies:
             for tax_name in default_taxonomies:
                 tax_instance = load_default_taxonomy(tax_name)
                 self.register_taxonomy(tax_instance)
-
-        # Bi-encoder and task embeddings
-        logger.info("Setting up bi-encoder and task corpus...")
-        self.embedding_model_name = embedding_model
-        self.embedding_model = get_shared_model(embedding_model, self.device, token=self.hf_token)
 
         # Candidate extraction pipeline
         logger.info("Setting up candidate extraction classifier...")
