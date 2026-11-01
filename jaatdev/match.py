@@ -180,7 +180,7 @@ class Match:
         template: str,
         batch_size: int = 128,
         min_nli_margin: float = 0.10
-    ) -> List[float]:
+    ) -> List[Dict[str, Any]]:
         """Runs NLI verification: premise (query/sentence), hypothesis (templated task)."""
         if not pairs or not self.nli_model:
             return []
@@ -312,7 +312,7 @@ class Match:
         slice_offsets = [0]
         for i, (orig_doc_idx, query_sent) in enumerate(all_data):
             dense_cand_ids = top_indices_cpu[i].tolist()
-            dense_score_lookup = dict(zip(dense_cand_ids, top_indices_cpu[i].tolist()))
+            dense_score_lookup = dict(zip(dense_cand_ids, top_scores_cpu[i].tolist()))
 
             q_tokens = bm25_tokenize(query_sent)
             bm25_scores = tax.bm25.get_scores(q_tokens)
@@ -376,11 +376,11 @@ class Match:
                 batch_size=128,
                 min_nli_margin=0.10
             )
-            for r, n_score in zip(selected_records, nli_scores):
-                r["nli_score"] = n_score
+            for r, n_data in zip(selected_records, nli_scores):
+                r["nli_data"] = n_data
         else:
             for r in selected_records:
-                r["nli_score"] = None
+                r["nli_data"] = None
 
         # Filter by minimum confidence and structure output
         aggregated_by_doc: List[Dict[str, Dict[str, Any]]] = [{} for _ in range(len(texts))]
@@ -405,6 +405,8 @@ class Match:
                 "sentence": r["query_sent"],
                 "score": curr_score,
             }
+            if return_original:
+                evidence_item["sentence"] = r["query_sent"]
             if verify_nli:
                 evidence_item["verification_score"] = v_score
 
@@ -419,6 +421,8 @@ class Match:
                     "frequency": 1,
                     "evidence": [evidence_item],
                 }
+                if return_original:
+                    doc_store[c_id]["query_sentence"] = r["query_sent"]
                 if verify_nli:
                     doc_store[c_id]["verification_score"] = v_score
             else:
@@ -427,6 +431,8 @@ class Match:
 
                 if curr_score > doc_store[c_id]["score"]:
                     doc_store[c_id]["score"] = curr_score
+                    if return_original:
+                        doc_store[c_id]["query_sentence"] = r["query_sent"]
                     if verify_nli:
                         doc_store[c_id]["verification_score"] = v_score
 
