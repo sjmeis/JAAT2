@@ -60,7 +60,7 @@ class Match:
         classification_model: str = "sjmeis/skill-classifier-base-v3.5",
         nli_model: Optional[str] = "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli", #"cross-encoder/nli-deberta-v3-base"
         hf_token: Optional[str] = None,
-        default_taxonomies: Optional[List[str]] = ("tasks", "skills", "ai_codes"),
+        default_taxonomies: Optional[List[str]] = ("tasks", "skills", "ai"),
         query_prefix: str = "",
         document_prefix: str = "",
         initial_top_n: int = 25,
@@ -370,7 +370,7 @@ class Match:
         # Optional NLI Verification
         if verify_nli and self.nli_model and selected_records:
             nli_pairs = [(r["text"], r["query_sent"]) for r in selected_records]
-            nli_scores = self._score_nli_entailment_batched(
+            nli_scores = self._score_nli_entailment(
                 nli_pairs,
                 template=tax.nli_template,
                 batch_size=128,

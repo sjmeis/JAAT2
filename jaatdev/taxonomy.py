@@ -115,7 +115,7 @@ DEFAULT_TAXONOMIES: Dict[str, Dict[str, Any]] = {
         "cross_encoder_template": "Demonstrates proficiency and application of {text}.",
         "nli_template": "This statement demonstrates personal proficiency in {text}."
     },
-    "ai_codes": {
+    "ai": {
         "filename": "ai_a6_5_redacted_final2.csv",
         "id_column": "Code",
         "text_column": "Statement",
