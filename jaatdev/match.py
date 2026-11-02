@@ -1,4 +1,4 @@
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Dict, Any, Optional, Generator
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -43,6 +43,43 @@ def reciprocal_rank_fusion(
 
     sorted_candidates = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)
     return sorted_candidates[:top_n]
+
+def chunked_dense_retrieval(
+    query_embeds: torch.Tensor,
+    tax_embeds: torch.Tensor,
+    k: int,
+    query_chunk_size: int = 4096,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Computes top-k retrieval in query chunks."""
+    all_top_scores = []
+    all_top_indices = []
+
+    for i in range(0, query_embeds.shape[0], query_chunk_size):
+        chunk_q = query_embeds[i:i + query_chunk_size]
+        sim_chunk = torch.mm(chunk_q, tax_embeds.T)
+        scores, indices = torch.topk(sim_chunk, k=k, dim=1)
+        all_top_scores.append(scores.cpu().to(torch.float32).numpy())
+        all_top_indices.append(indices.cpu().numpy())
+        del sim_chunk
+
+    return np.vstack(all_top_scores), np.vstack(all_top_indices)
+
+def fast_bm25_topk(bm25_index, queries: List[str], k: int) -> List[List[int]]:
+    """Runs BM25 tokenized queries with fast generator iteration."""
+    tokenized = [bm25_tokenize(q) for q in queries]
+    results = []
+    for q_tokens in tokenized:
+        if not q_tokens:
+            results.append([])
+            continue
+        scores = bm25_index.get_scores(q_tokens)
+        if len(scores) <= k:
+            top_k_idx = np.argsort(scores)[::-1].tolist()
+        else:
+            partitioned = np.argpartition(scores, -k)[-k:]
+            top_k_idx = partitioned[np.argsort(scores[partitioned])[::-1]].tolist()
+        results.append(top_k_idx)
+    return results
 
 @dataclass
 class MatchResult:
@@ -305,19 +342,21 @@ class Match:
             q_embed = self.embedding_model.encode(
                 queries,
                 convert_to_tensor=True,
-                batch_size=128,
+                batch_size=256,
                 show_progress_bar=GLOBAL_SETTINGS.get("show_progress", False)
             ).to(self.device)
             q_embed = F.normalize(q_embed, p=2, dim=1)
 
             with torch.autocast(device_type="cuda" if use_cuda else "cpu", dtype=autocast_dtype, enabled=use_cuda):
-                sim_matrix = torch.mm(q_embed, tax.embeddings.T)
+                top_scores_cpu, top_indices_cpu = chunked_dense_retrieval(
+                    q_embed, tax.embeddings, k=min(self.initial_top_n, tax.embeddings.shape[0])
+                )
 
-            k_retrieval = min(self.initial_top_n, tax.embeddings.shape[0])
-            top_scores, top_indices = torch.topk(sim_matrix, k=k_retrieval, dim=1)
+            del q_embed
+            if use_cuda:
+                torch.cuda.empty_cache()
 
-        top_indices_cpu = top_indices.cpu().numpy()
-        top_scores_cpu = top_scores.cpu().to(torch.float32).numpy()
+        bm25_top_indices = fast_bm25_topk(tax.bm25, [d[1] for d in all_data], k=self.initial_top_n)
 
         # Per-candidate reranking, flattening for global calculation
         flat_candidate_records = []
@@ -325,10 +364,7 @@ class Match:
         for i, (orig_doc_idx, query_sent) in enumerate(all_data):
             dense_cand_ids = top_indices_cpu[i].tolist()
             dense_score_lookup = dict(zip(dense_cand_ids, top_scores_cpu[i].tolist()))
-
-            q_tokens = bm25_tokenize(query_sent)
-            bm25_scores = tax.bm25.get_scores(q_tokens)
-            bm25_cand_ids = np.argsort(bm25_scores)[::-1][:k_retrieval].tolist()
+            bm25_cand_ids = bm25_top_indices[i]
 
             fused_cand_ids = reciprocal_rank_fusion(
                 dense_ranked_indices=dense_cand_ids,
@@ -460,6 +496,42 @@ class Match:
             final_results.append(doc_items)
 
         return final_results
+
+    def match_dataset(
+        self,
+        texts: List[str],
+        taxonomy_name: str,
+        doc_chunk_size: int = 1000,
+        top_k: Optional[int] = None,
+        verify_nli: bool = False,
+        return_original: bool = False
+    ) -> Generator[List[Dict[str, Any]], None, None]:
+        """
+        Streaming runner for many documents.
+        Processes documents in chunks, yielding results doc by doc.
+        """
+        total_docs = len(texts)
+        logger.info(f"Processing {total_docs} documents in batches of {doc_chunk_size}...")
+
+        for start_idx in range(0, total_docs, doc_chunk_size):
+            end_idx = min(start_idx + doc_chunk_size, total_docs)
+            chunk_texts = texts[start_idx:end_idx]
+
+            logger.info(f"Processing chunk {start_idx} to {end_idx}...")
+            chunk_results = self.match_batch(
+                texts=chunk_texts,
+                taxonomy_name=taxonomy_name,
+                top_k=top_k,
+                verify_nli=verify_nli,
+                return_original=return_original
+            )
+
+            for doc_result in chunk_results:
+                yield doc_result
+
+            del chunk_results
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def match(
         self,
