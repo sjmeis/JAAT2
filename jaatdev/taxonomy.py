@@ -186,6 +186,7 @@ class Taxonomy:
         use_cache: bool = True
     ) -> None:
         cache_file = None
+        dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
         if use_cache and isinstance(self.data_source, (str, Path)):
             cache_file = _get_cache_path(
                 Path(self.data_source), 
@@ -195,7 +196,9 @@ class Taxonomy:
             )
             if cache_file.exists():
                 logger.info(f"Loading precomputed embeddings from {cache_file.name}")
-                self.embeddings = torch.load(cache_file, map_location=device, weights_only=True)
+                loaded = torch.load(cache_file, map_location=device, weights_only=True)
+                self.embeddings = loaded.to(device=device, dtype=dtype)
+                self.embeddings_T = self.embeddings.t().contiguous()
                 return
 
         logger.info(f"Computing embeddings for taxonomy '{self.name}' using {model_name}...")
@@ -205,8 +208,9 @@ class Taxonomy:
             convert_to_tensor=True,
             batch_size=batch_size,
             show_progress_bar=show_progress
-        ).to(device)
+        ).to(device, dtype=dtype)
         self.embeddings = F.normalize(embeds, p=2, dim=1)
+        self.embeddings_T = self.embeddings.t().contiguous()
 
         if cache_file is not None:
             try:

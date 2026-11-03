@@ -26,6 +26,30 @@ def get_shared_cross_encoder(model_name: str, device: str, token: Optional[str] 
         MODEL_CACHE[key] = CrossEncoder(model_name, device=device, token=token)
     return MODEL_CACHE[key]
 
+def predict_with_length_sorting(
+    cross_encoder: CrossEncoder,
+    pairs: List[Tuple[str, str]],
+    batch_size: int = 512,
+    show_progress_bar: bool = True
+) -> np.ndarray:
+    if not pairs:
+        return np.array([], dtype=np.float32)
+
+    lengths = [len(p[0]) + len(p[1]) for p in pairs]
+    sort_indices = np.argsort(lengths)
+    sorted_pairs = [pairs[i] for i in sort_indices]
+
+    preds = cross_encoder.predict(
+        sorted_pairs,
+        batch_size=batch_size,
+        show_progress_bar=show_progress_bar,
+        convert_to_numpy=True
+    )
+
+    unsort_indices = np.empty_like(sort_indices)
+    unsort_indices[sort_indices] = np.arange(len(sort_indices))
+    return preds[unsort_indices]
+
 @dataclass
 class MatchResult:
     task_id: str
@@ -279,89 +303,105 @@ class Match:
         if not all_data:
             return results
 
-        # Embedding coarse search
-        logger.info("Running coarse retrieval...")
-        M = len(all_data)
-        query_texts = [d[1] for d in all_data]
-        doc_indices = np.array([d[0] for d in all_data], dtype=np.int32)
-        queries = [f"{self.query_prefix}{q}" for q in query_texts]
+        raw_query_texts = [d[1] for d in all_data]
+        unique_queries, inverse_map = np.unique(raw_query_texts, return_inverse=True)
+        U = len(unique_queries)
 
         use_cuda = "cuda" in str(self.device)
         autocast_dtype = torch.bfloat16 if (use_cuda and torch.cuda.is_bf16_supported()) else torch.float16
 
+        # Embedding coarse search
+        logger.info("Running coarse retrieval...")
+        prefixed_unique = [f"{self.query_prefix}{q}" for q in unique_queries]
+
         with torch.inference_mode():
             q_embed = self.embedding_model.encode(
-                queries,
+                prefixed_unique,
                 convert_to_tensor=True,
                 batch_size=512,
                 show_progress_bar=GLOBAL_SETTINGS.get("show_progress", False)
-            ).to(self.device)
+            ).to(self.device, dtype=autocast_dtype)
             q_embed = F.normalize(q_embed, p=2, dim=1)
 
             k_pool = min(self.initial_top_n * 2, tax.embeddings.shape[0])
             with torch.autocast(device_type="cuda" if use_cuda else "cpu", dtype=autocast_dtype, enabled=use_cuda):
-                sim_matrix = torch.mm(q_embed, tax.embeddings.T)
-                _, dense_top_indices_gpu = torch.topk(sim_matrix, k=k_pool, dim=1)
+                sim_matrix = torch.mm(q_embed, tax.embeddings_T)
+                dense_top_scores, dense_top_indices_gpu = torch.topk(sim_matrix, k=k_pool, dim=1)
             del q_embed, sim_matrix
 
-            bm25_top_indices_gpu = tax.bm25.query_topk(query_texts, k=k_pool)
+            confident_mask = (dense_top_scores[:, 0] >= 0.85)
+            uncertain_indices = torch.where(~confident_mask)[0].cpu().tolist()
+            fused_cand_gpu = dense_top_indices_gpu[:, :self.initial_top_n].clone()
 
-            # RRF completely on GPU (No CPU transfers)
-            ranks = torch.arange(1, k_pool + 1, device=self.device, dtype=torch.float32)
-            rrf_weights = 1.0 / (60 + ranks)
+            if uncertain_indices:
+                uncertain_texts = [unique_queries[i] for i in uncertain_indices]
+                bm25_top_indices_gpu = tax.bm25.query_topk(uncertain_texts, k=k_pool)
 
-            fused_scores = torch.zeros((M, len(tax.codes_arr)), device=self.device, dtype=torch.float32)
-            fused_scores.scatter_add_(1, dense_top_indices_gpu, rrf_weights.unsqueeze(0).expand(M, -1))
-            fused_scores.scatter_add_(1, bm25_top_indices_gpu, rrf_weights.unsqueeze(0).expand(M, -1))
+                sub_dense = dense_top_indices_gpu[uncertain_indices]
+                sub_M = len(uncertain_indices)
 
-            _, fused_cand_gpu = torch.topk(fused_scores, k=self.initial_top_n, dim=1)
-            del dense_top_indices_gpu, bm25_top_indices_gpu, fused_scores
+                ranks = torch.arange(1, k_pool + 1, device=self.device, dtype=torch.float32)
+                rrf_weights = 1.0 / (60 + ranks)
 
-        fused_cand_np = fused_cand_gpu.cpu().numpy()
+                fused_scores = torch.zeros((sub_M, len(tax.codes_arr)), device=self.device, dtype=torch.float32)
+                fused_scores.scatter_add_(1, sub_dense, rrf_weights.unsqueeze(0).expand(sub_M, -1))
+                fused_scores.scatter_add_(1, bm25_top_indices_gpu, rrf_weights.unsqueeze(0).expand(sub_M, -1))
+
+                _, sub_fused = torch.topk(fused_scores, k=self.initial_top_n, dim=1)
+                fused_cand_gpu[uncertain_indices] = sub_fused
+                del fused_scores, bm25_top_indices_gpu
+
+            del dense_top_scores, dense_top_indices_gpu
+
+        fused_cand_unique = fused_cand_gpu.cpu().numpy()
         del fused_cand_gpu
 
         K = self.initial_top_n
-        flat_q_idx = np.repeat(np.arange(M), K)
-        flat_cand_idx = fused_cand_np.flatten()
+        flat_uq_idx = np.repeat(np.arange(M), K)
+        flat_cand_idx = fused_cand_unique.flatten()
 
         ce_pairs = [
-            (query_texts[qi], tax.ce_targets[ci]) 
-            for qi, ci in zip(flat_q_idx, flat_cand_idx)
+            (unique_queries[qi], tax.ce_targets[ci]) 
+            for qi, ci in zip(flat_uq_idx, flat_cand_idx)
         ]
 
         # Cross-Encoder Rerank
         logger.info("Re-ranking...")
-        raw_ce_preds = self.cross_encoder.predict(
-            ce_pairs,
-            batch_size=512,
-            show_progress_bar=GLOBAL_SETTINGS.get("show_progress", True),
-            convert_to_numpy=True
-        )
+        raw_ce_preds = predict_with_length_sorting(
+                self.cross_encoder,
+                ce_pairs,
+                batch_size=512,
+                show_progress_bar=GLOBAL_SETTINGS.get("show_progress", True)
+            )
         scaled_scores = 1.0 / (1.0 + np.exp(-(raw_ce_preds + 1.5) / self.cross_temp))
 
-        query_cand_scores = scaled_scores.reshape(M, K)
+        unique_query_cand_scores = scaled_scores.reshape(M, K)
 
         # Apply Cutoff
-        sort_order = np.argsort(-query_cand_scores, axis=1)
-        sorted_scores = np.take_along_axis(query_cand_scores, sort_order, axis=1)
-        sorted_cands = np.take_along_axis(fused_cand_np, sort_order, axis=1)
+        M = len(all_data)
+        doc_indices = [d[0] for d in all_data]
 
         selected_records = []
         for i in range(M):
-            row_scores = sorted_scores[i]
-            row_cands = sorted_cands[i]
+            u_idx = inverse_map[i]
+            scores_row = unique_query_cand_scores[u_idx]
+            cands_row = fused_cand_unique[u_idx]
 
-            cutoff = min(top_k, K) if top_k is not None else self._find_adaptive_elbow(row_scores.tolist())
+            sort_order = np.argsort(-scores_row)
+            sorted_scores = scores_row[sort_order]
+            sorted_cands = cands_row[sort_order]
+
+            cutoff = min(top_k, K) if top_k is not None else self._find_adaptive_elbow(sorted_scores.tolist())
 
             for rank_idx in range(cutoff):
-                sc = row_scores[rank_idx]
+                sc = sorted_scores[rank_idx]
                 if sc < self.threshold:
-                    break  # all subsequent items are below threshold
+                    break
                 
-                c_idx = row_cands[rank_idx]
+                c_idx = sorted_cands[rank_idx]
                 selected_records.append({
                     "orig_doc_idx": doc_indices[i],
-                    "query_sent": query_texts[i],
+                    "query_sent": raw_query_texts[i],
                     "code": tax.codes_arr[c_idx],
                     "text": tax.texts_arr[c_idx],
                     "score": float(sc)
@@ -393,7 +433,7 @@ class Match:
 
             d_idx = r["orig_doc_idx"]
             c_id = r["code"]
-            curr_score = round(r["final_score"], 4)
+            curr_score = round(r["score"], 4)
             v_score = (
                 round(r["nli_data"]["entailment_prob"], 4)
                 if (verify_nli and r["nli_data"] is not None)
