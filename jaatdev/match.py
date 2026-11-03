@@ -64,7 +64,7 @@ class Match:
         embedding_model: str = "sjmeis/skills-embedding-gemma",
         cross_encoder_model: str = "sjmeis/task-cross-encoder-v1",
         classification_model: str = "sjmeis/skill-classifier-small-v3.5",
-        nli_model: Optional[str] = "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli", #"cross-encoder/nli-deberta-v3-base"
+        nli_model: Optional[str] = "cross-encoder/nli-deberta-v3-xsmall", #"cross-encoder/nli-deberta-v3-base"
         hf_token: Optional[str] = None,
         default_taxonomies: Optional[List[str]] = ("tasks", "skills", "ai"),
         query_prefix: str = "",
@@ -135,6 +135,7 @@ class Match:
         id2label = {v.lower(): k for k, v in self.nli_model.config.id2label.items()}
         self.entail_idx = id2label.get("entailment", 0)
         self.neutral_idx = id2label.get("neutral", 1)
+        self.contra_idx = id2label.get("contradiction", 2 if self.entail_idx != 2 and self.neutral_idx != 2 else 0)
 
     def register_taxonomy(self, taxonomy: Taxonomy) -> None:
         """Indexes and stores a taxonomy."""
@@ -190,29 +191,45 @@ class Match:
         self,
         pairs: List[Tuple[str, str]],
         template: str,
-        batch_size: int = 128,
-        min_nli_margin: float = 0.10
+        batch_size: int = 1024,
+        min_nli_margin: float = 0.05,
+        min_entail_prob: float = 0.35,
+        max_contradiction_prob: float = 0.25
     ) -> List[Dict[str, Any]]:
         """Runs NLI verification: premise (query/sentence), hypothesis (templated task)."""
         if not pairs or not self.nli_model:
             return []
 
-        premises = [ctx for _, ctx in pairs]
-        hypotheses = [template.format(text=target.lower().strip()) for target, _ in pairs]
+        unique_pairs, inverse_indices = [], []
+        pair_to_idx = {}
+        for p in pairs:
+            if p not in pair_to_idx:
+                pair_to_idx[p] = len(unique_pairs)
+                unique_pairs.append(p)
+            inverse_indices.append(pair_to_idx[p])
 
-        all_scores: List[Dict[str, Any]] = []
+        premises = [ctx for _, ctx in unique_pairs]
+        hypotheses = [template.format(text=target.lower().strip()) for target, _ in unique_pairs]
+        num_unique = len(unique_pairs)
+
+        lengths = [len(p) + len(h) for p, h in zip(premises, hypotheses)]
+        sort_order = np.argsort(lengths)
+        sorted_premises = [premises[i] for i in sort_order]
+        sorted_hypotheses = [hypotheses[i] for i in sort_order]
+
+        unique_results = [None] * num_unique
         use_cuda = "cuda" in str(self.device)
         autocast_dtype = torch.bfloat16 if (use_cuda and torch.cuda.is_bf16_supported()) else torch.float16
 
         pbar = progress_bar(
-            range(0, len(pairs), batch_size),
+            range(0, num_unique, batch_size),
             desc="NLI Verification",
-            total=(len(pairs) + batch_size - 1) // batch_size
+            total=(num_unique + batch_size - 1) // batch_size
         )
 
         for i in pbar:
-            b_prem = premises[i:i + batch_size]
-            b_hypo = hypotheses[i:i + batch_size]
+            b_prem = sorted_premises[i:i + batch_size]
+            b_hypo = sorted_hypotheses[i:i + batch_size]
 
             encoded = self.nli_tokenizer(
                 b_prem,
@@ -228,20 +245,26 @@ class Match:
                     logits = self.nli_model(**encoded).logits
                     probs = F.softmax(logits, dim=-1)
                 
-                p_entail = probs[:, self.entail_idx].cpu().numpy()
-                p_neutral = probs[:, self.neutral_idx].cpu().numpy()
+                p_entail = probs[:, self.entail_idx].cpu().to(torch.float32).numpy()
+                p_neutral = probs[:, self.neutral_idx].cpu().to(torch.float32).numpy()
+                p_contra = probs[:, self.contra_idx].cpu().to(torch.float32).numpy()
 
-            for pe, pn in zip(p_entail, p_neutral):
-                margin = float(pe - pn)
-                is_verified = (pe > pn) and (margin >= min_nli_margin)
-                all_scores.append({
+            for idx_in_batch, (pe, pn, pc) in enumerate(zip(p_entail, p_neutral, p_contra)):
+                orig_sorted_idx = i + idx_in_batch
+                orig_unique_idx = sort_order[orig_sorted_idx]
+                is_verified = bool(
+                    (pc <= max_contradiction_prob) and 
+                    (pe >= min_entail_prob or pe >= (pn - min_nli_margin))
+                )
+                unique_results[orig_unique_idx] = {
                     "entailment_prob": round(float(pe), 4),
                     "neutral_prob": round(float(pn), 4),
-                    "margin": round(margin, 4),
-                    "verified": bool(is_verified)
-                })
+                    "contradiction_prob": round(float(pc), 4),
+                    "margin": round(float(pe - pn), 4),
+                    "verified": is_verified
+                }
 
-        return all_scores
+        return [unique_results[idx] for idx in inverse_indices]
 
     @staticmethod
     def _find_adaptive_elbow(
@@ -375,7 +398,7 @@ class Match:
             )
         scaled_scores = 1.0 / (1.0 + np.exp(-(raw_ce_preds + 1.5) / self.cross_temp))
 
-        unique_query_cand_scores = scaled_scores.reshape(M, K)
+        unique_query_cand_scores = scaled_scores.reshape(U, K)
 
         # Apply Cutoff
         M = len(all_data)
@@ -409,16 +432,33 @@ class Match:
 
         # Optional NLI Verification
         if verify_nli and self.nli_model and selected_records:
+            nli_candidates = []
+            nli_cand_indices = []
+
+            for idx, r in enumerate(selected_records):
+                if r["score"] >= 0.8: # hard-coded auto-verify!
+                    r["nli_data"] = {
+                        "entailment_prob": 1.0,
+                        "neutral_prob": 0.0,
+                        "contradiction_prob": 0.0,
+                        "margin": 1.0,
+                        "verified": True
+                    }
+                else:
+                    nli_candidates.append((r["text"], r["query_sent"]))
+                    nli_cand_indices.append(idx)
+
             logger.info("Running verification...")
-            nli_pairs = [(r["text"], r["query_sent"]) for r in selected_records]
-            nli_scores = self._score_nli_entailment(
-                nli_pairs,
-                template=tax.nli_template,
-                batch_size=512,
-                min_nli_margin=0.05
-            )
-            for r, n_data in zip(selected_records, nli_scores):
-                r["nli_data"] = n_data
+            if nli_candidates:
+                nli_scores = self._score_nli_entailment(
+                    nli_candidates,
+                    template=tax.nli_template,
+                    batch_size=1024,
+                    min_entail_prob=0.35,
+                    max_contradiction_prob=0.25
+                )
+                for orig_idx, n_data in zip(nli_cand_indices, nli_scores):
+                    selected_records[orig_idx]["nli_data"] = n_data
         else:
             for r in selected_records:
                 r["nli_data"] = None
