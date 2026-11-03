@@ -75,7 +75,7 @@ class Match:
         default_taxonomies: Optional[List[str]] = ("tasks", "skills", "ai"),
         query_prefix: str = "",
         document_prefix: str = "",
-        initial_top_n: int = 50,
+        initial_top_n: int = 25,
         threshold: float = 0.70,
         cross_temp: float = 1.0,
     ) -> None:
@@ -186,8 +186,8 @@ class Match:
         template: str,
         batch_size: int = 1024,
         min_nli_margin: float = 0.05,
-        min_entail_prob: float = 0.30,
-        max_contradiction_prob: float = 0.20
+        min_entail_prob: float = 0.50,
+        max_contradiction_prob: float = 0.15
     ) -> List[Dict[str, Any]]:
         """Runs NLI verification: premise (query/sentence), hypothesis (templated task)."""
         if not pairs or not self.nli_model:
@@ -248,9 +248,8 @@ class Match:
                 not_contradiction = (pc <= max_contradiction_prob)
 
                 has_entailment_signal = (
-                    (pe >= min_entail_prob and pe > pc * 2.0) or
-                    (pe >= pn - min_nli_margin) or
-                    ((pe + 0.35 * pn) >= 0.40)
+                    (pe >= min_entail_prob and pe > pc * 3.0) or
+                    (pe >= min_entail_prob - 0.10 and (pe - pn) >= -min_nli_margin)
                 )
 
                 is_verified = bool(not_contradiction and has_entailment_signal)
@@ -467,7 +466,8 @@ class Match:
                 continue
 
             if verify_nli and r["nli_data"] is not None:
-                if not r["nli_data"]["verified"]:
+                n_data = r["nli_data"]               
+                if not n_data["verified"]:
                     continue
 
             d_idx = r["orig_doc_idx"]
