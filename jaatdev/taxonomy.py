@@ -57,6 +57,15 @@ class Taxonomy:
             .reset_index(drop=True)
         )
         self.df["id"] = self.df["id"].astype(str)
+        self.df["text"] = self.df["text"].astype(str)
+
+        self.codes_arr = self.df["id"].to_numpy()
+        self.texts_arr = self.df["text"].to_numpy()
+        
+        self.ce_targets = [
+            self.cross_encoder_template.format(text=t.lower()) 
+            for t in self.texts_arr
+        ]
 
         corpus_tokenized = [bm25_tokenize(t) for t in self.df["text"].tolist()]
         self.bm25 = BM25Okapi(corpus_tokenized)

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import multiprocessing as mp
 from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
 from sentence_transformers import SentenceTransformer, CrossEncoder
+from concurrent.futures import ThreadPoolExecutor
 
 from .base import ListDataset, get_device_settings, get_sentence_splitter
 from .config import MODEL_CACHE, logger, GLOBAL_SETTINGS
@@ -27,22 +28,29 @@ def get_shared_cross_encoder(model_name: str, device: str, token: Optional[str] 
     return MODEL_CACHE[key]
 
 def reciprocal_rank_fusion(
-    dense_ranked_indices: List[int],
-    bm25_ranked_indices: List[int],
-    top_n: int,
+    dense_top_indices: torch.Tensor,
+    bm25_top_indices: np.ndarray,
+    num_candidates: int,
+    k_out: int,
     rrf_k: int = 60
 ) -> List[int]:
     """Combines dense and lexical rankings using standard RRF."""
-    rrf_scores: Dict[int, float] = {}
+    M, K = dense_top_indices.shape
+    device = dense_top_indices.device
 
-    for rank, idx in enumerate(dense_ranked_indices):
-        rrf_scores[idx] = rrf_scores.get(idx, 0.0) + (1.0 / (rrf_k + rank + 1))
+    bm25_tensor = torch.from_numpy(bm25_top_indices).to(device=device, dtype=torch.long)
 
-    for rank, idx in enumerate(bm25_ranked_indices):
-        rrf_scores[idx] = rrf_scores.get(idx, 0.0) + (1.0 / (rrf_k + rank + 1))
+    ranks = torch.arange(1, K + 1, device=device, dtype=torch.float32)
+    rrf_weights = 1.0 / (rrf_k + ranks)  # Shape (K,)
 
-    sorted_candidates = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)
-    return sorted_candidates[:top_n]
+    fused_scores = torch.zeros((M, num_candidates), device=device, dtype=torch.float32)
+    
+    fused_scores.scatter_add_(1, dense_top_indices, rrf_weights.unsqueeze(0).expand(M, -1))
+    fused_scores.scatter_add_(1, bm25_tensor, rrf_weights.unsqueeze(0).expand(M, -1))
+
+    _, final_top_indices = torch.topk(fused_scores, k=k_out, dim=1)
+    
+    return final_top_indices.cpu().numpy()
 
 def chunked_dense_retrieval(
     query_embeds: torch.Tensor,
@@ -64,22 +72,23 @@ def chunked_dense_retrieval(
 
     return np.vstack(all_top_scores), np.vstack(all_top_indices)
 
-def fast_bm25_topk(bm25_index, queries: List[str], k: int) -> List[List[int]]:
-    """Runs BM25 tokenized queries with fast generator iteration."""
-    tokenized = [bm25_tokenize(q) for q in queries]
-    results = []
-    for q_tokens in tokenized:
-        if not q_tokens:
-            results.append([])
-            continue
-        scores = bm25_index.get_scores(q_tokens)
-        if len(scores) <= k:
-            top_k_idx = np.argsort(scores)[::-1].tolist()
-        else:
-            partitioned = np.argpartition(scores, -k)[-k:]
-            top_k_idx = partitioned[np.argsort(scores[partitioned])[::-1]].tolist()
-        results.append(top_k_idx)
-    return results
+def _bm25_worker(args):
+    bm25_index, query_text, k = args
+    tokens = bm25_tokenize(query_text)
+    if not tokens:
+        return [0] * k
+    scores = bm25_index.get_scores(tokens)
+    # Fast partial partition
+    if len(scores) <= k:
+        return np.argsort(scores)[::-1].tolist()
+    part = np.argpartition(scores, -k)[-k:]
+    return part[np.argsort(scores[part])[::-1]].tolist()
+
+def bm25_topk(bm25_index, queries: List[str], k: int, num_workers: int = 8) -> List[List[int]]:
+    tasks = [(bm25_index, q, k) for q in queries]
+    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+        results = list(pool.map(_bm25_worker, tasks))
+    return np.array(results, dtype=np.int64)
 
 @dataclass
 class MatchResult:
@@ -94,14 +103,14 @@ class Match:
         self,
         embedding_model: str = "sjmeis/skills-embedding-gemma",
         cross_encoder_model: str = "sjmeis/task-cross-encoder-v1",
-        classification_model: str = "sjmeis/skill-classifier-base-v3.5",
+        classification_model: str = "sjmeis/skill-classifier-small-v3.5",
         nli_model: Optional[str] = "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli", #"cross-encoder/nli-deberta-v3-base"
         hf_token: Optional[str] = None,
         default_taxonomies: Optional[List[str]] = ("tasks", "skills", "ai"),
         query_prefix: str = "",
         document_prefix: str = "",
         initial_top_n: int = 25,
-        threshold: float = 0.60,
+        threshold: float = 0.50,
         cross_temp: float = 1.0,
     ) -> None:
         logger.info("Initializing Match pipeline...")
@@ -334,7 +343,11 @@ class Match:
             return results
 
         # Embedding coarse search
-        queries = [f"{self.query_prefix}{d[1]}" for d in all_data]
+        M = len(all_data)
+        query_texts = [d[1] for d in all_data]
+        doc_indices = np.array([d[0] for d in all_data], dtype=np.int32)
+        queries = [f"{self.query_prefix}{q}" for q in query_texts]
+
         use_cuda = "cuda" in str(self.device)
         autocast_dtype = torch.bfloat16 if (use_cuda and torch.cuda.is_bf16_supported()) else torch.float16
 
@@ -342,78 +355,74 @@ class Match:
             q_embed = self.embedding_model.encode(
                 queries,
                 convert_to_tensor=True,
-                batch_size=256,
+                batch_size=512,
                 show_progress_bar=GLOBAL_SETTINGS.get("show_progress", False)
             ).to(self.device)
             q_embed = F.normalize(q_embed, p=2, dim=1)
 
             with torch.autocast(device_type="cuda" if use_cuda else "cpu", dtype=autocast_dtype, enabled=use_cuda):
-                top_scores_cpu, top_indices_cpu = chunked_dense_retrieval(
-                    q_embed, tax.embeddings, k=min(self.initial_top_n, tax.embeddings.shape[0])
-                )
+                k_dense = min(self.initial_top_n * 2, tax.embeddings.shape[0])
+                dense_cand_indices = []
+                for chunk_start in range(0, M, 4096):
+                    sim_chunk = torch.mm(q_embed[chunk_start:chunk_start + 4096], tax.embeddings.T)
+                    _, chunk_top_idx = torch.topk(sim_chunk, k=k_dense, dim=1)
+                    dense_cand_indices.append(chunk_top_idx)
+
+                dense_top_indices_gpu = torch.cat(dense_cand_indices, dim=0)
 
             del q_embed
-            if use_cuda:
-                torch.cuda.empty_cache()
 
-        bm25_top_indices = fast_bm25_topk(tax.bm25, [d[1] for d in all_data], k=self.initial_top_n)
+        bm25_top_indices = bm25_topk(tax.bm25, query_texts, k=k_dense, num_workers=min(self.num_workers, 16))
 
-        # Per-candidate reranking, flattening for global calculation
-        flat_candidate_records = []
-        slice_offsets = [0]
-        for i, (orig_doc_idx, query_sent) in enumerate(all_data):
-            dense_cand_ids = top_indices_cpu[i].tolist()
-            dense_score_lookup = dict(zip(dense_cand_ids, top_scores_cpu[i].tolist()))
-            bm25_cand_ids = bm25_top_indices[i]
+        fused_cand_indices = reciprocal_rank_fusion(
+            dense_top_indices=dense_top_indices_gpu,
+            bm25_top_indices=bm25_top_indices,
+            num_candidates=len(tax.codes_arr),
+            k_out=self.initial_top_n
+        )
+        del dense_top_indices_gpu
 
-            fused_cand_ids = reciprocal_rank_fusion(
-                dense_ranked_indices=dense_cand_ids,
-                bm25_ranked_indices=bm25_cand_ids,
-                top_n=self.initial_top_n
-            )
+        K_pool = self.initial_top_n
+        flat_q_indices = np.repeat(np.arange(M), K_pool)
+        flat_cand_indices = fused_cand_indices.flatten()
 
-            rows = tax.df.iloc[fused_cand_ids]
-            for c_idx, (_, row) in zip(fused_cand_ids, rows.iterrows()):
-                flat_candidate_records.append({
-                    "orig_doc_idx": orig_doc_idx,
-                    "query_sent": query_sent,
-                    "code": row["id"],
-                    "text": row["text"],
-                    "bi_score": float(dense_score_lookup.get(c_idx, 0.0))
-                })
-            slice_offsets.append(len(flat_candidate_records))
+        ce_queries = [query_texts[qi] for qi in flat_q_indices]
+        ce_targets = [tax.ce_targets[ci] for ci in flat_cand_indices]
+        ce_pairs = list(zip(ce_queries, ce_targets))
 
         # Cross-Encoder Rerank
-        if self.cross_encoder and flat_candidate_records:
-            ce_pairs = [
-                (r["query_sent"], tax.cross_encoder_template.format(text=r["text"].lower()))
-                for r in flat_candidate_records
-            ]
-            raw_ce_preds = self.cross_encoder.predict(
-                ce_pairs,
-                batch_size=128,
-                show_progress_bar=GLOBAL_SETTINGS.get("show_progress", True),
-                convert_to_numpy=True
-            )
-            scaled_scores = 1.0 / (1.0 + np.exp(-(raw_ce_preds + 1.5) / self.cross_temp))
-            for r, score in zip(flat_candidate_records, scaled_scores):
-                r["final_score"] = float(score)
-        else:
-            for r in flat_candidate_records:
-                r["final_score"] = r["bi_score"]
+        raw_ce_preds = self.cross_encoder.predict(
+            ce_pairs,
+            batch_size=256,
+            show_progress_bar=GLOBAL_SETTINGS.get("show_progress", True),
+            convert_to_numpy=True
+        )
+        scaled_scores = 1.0 / (1.0 + np.exp(-(raw_ce_preds + 1.5) / self.cross_temp))
 
+        query_cand_scores = scaled_scores.reshape(M, K_pool)
 
         # Apply Cutoff
         selected_records = []
-        for i in range(len(all_data)):
-            start, end = slice_offsets[i], slice_offsets[i + 1]
-            q_records = flat_candidate_records[start:end]
-            q_records.sort(key=lambda x: x["final_score"], reverse=True)
+        for i in range(M):
+            scores_row = query_cand_scores[i]
+            sort_order = np.argsort(scores_row)[::-1]
+            sorted_scores = scores_row[sort_order]
+            sorted_cands = fused_cand_indices[i][sort_order]
 
-            scores = [r["final_score"] for r in q_records]
-            cutoff = min(top_k, len(q_records)) if top_k is not None else self._find_adaptive_elbow(scores)
-            selected_records.extend(q_records[:cutoff])
+            cutoff = min(top_k, K_pool) if top_k is not None else self._find_adaptive_elbow(sorted_scores.tolist())
 
+            for rank_idx in range(cutoff):
+                sc = sorted_scores[rank_idx]
+                if sc < self.threshold:
+                    continue
+                c_idx = sorted_cands[rank_idx]
+                selected_records.append({
+                    "orig_doc_idx": doc_indices[i],
+                    "query_sent": query_texts[i],
+                    "code": tax.codes_arr[c_idx],
+                    "text": tax.texts_arr[c_idx],
+                    "score": float(sc)
+                })
 
         # Optional NLI Verification
         if verify_nli and self.nli_model and selected_records:
