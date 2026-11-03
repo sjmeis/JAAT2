@@ -225,21 +225,21 @@ DEFAULT_TAXONOMIES: Dict[str, Dict[str, Any]] = {
         "id_column": "Task ID",
         "text_column": "Task",
         "cross_encoder_template": "Demonstrates competence and activity in {text}.",
-        "nli_template": "This statement directly describes performing the work of {text}."
+        "nli_template": "This statement indicates experience with or responsibility for {text}."
     },
     "skills": {
         "filename": "skills.csv",
         "id_column": "EuropaCode",
         "text_column": "label",
         "cross_encoder_template": "Demonstrates proficiency and application of {text}.",
-        "nli_template": "This statement demonstrates personal proficiency in {text}."
+        "nli_template": "This statement demonstrates knowledge of or skill in {text}."
     },
     "ai": {
         "filename": "ai_a6_5_redacted_final2.csv",
         "id_column": "Code",
         "text_column": "Statement",
         "cross_encoder_template": "Uses or builds AI systems involving {text}.",
-        "nli_template": "This statement indicates the active utilization of {text}."
+        "nli_template": "This statement indicates the utilization of {text}."
     }
 }
 

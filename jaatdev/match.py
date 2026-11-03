@@ -70,7 +70,7 @@ class Match:
         query_prefix: str = "",
         document_prefix: str = "",
         initial_top_n: int = 25,
-        threshold: float = 0.65,
+        threshold: float = 0.30,
         cross_temp: float = 0.1,
     ) -> None:
         logger.info("Initializing Match pipeline...")
@@ -180,7 +180,7 @@ class Match:
         template: str,
         batch_size: int = 1024,
         min_nli_margin: float = 0.05,
-        min_entail_prob: float = 0.35,
+        min_entail_prob: float = 0.25,
         max_contradiction_prob: float = 0.25
     ) -> List[Dict[str, Any]]:
         """Runs NLI verification: premise (query/sentence), hypothesis (templated task)."""
@@ -239,10 +239,16 @@ class Match:
             for idx_in_batch, (pe, pn, pc) in enumerate(zip(p_entail, p_neutral, p_contra)):
                 orig_sorted_idx = i + idx_in_batch
                 orig_unique_idx = sort_order[orig_sorted_idx]
-                is_verified = bool(
-                    (pc <= max_contradiction_prob) and 
-                    (pe >= min_entail_prob or pe >= (pn - min_nli_margin))
+                not_contradiction = (pc <= max_contradiction_prob)
+
+                has_entailment_signal = (
+                    (pe >= min_entail_prob and pe > pc * 2.0) or
+                    (pe >= pn - min_nli_margin) or
+                    ((pe + 0.35 * pn) >= 0.40)
                 )
+
+                is_verified = bool(not_contradiction and has_entailment_signal)
+
                 unique_results[orig_unique_idx] = {
                     "entailment_prob": round(float(pe), 4),
                     "neutral_prob": round(float(pn), 4),
@@ -256,9 +262,9 @@ class Match:
     @staticmethod
     def _find_adaptive_elbow(
         scores: List[float],
-        min_score_floor: float = 0.30,
-        min_drop_ratio: float = 0.08,
-        high_confidence_retention: float = 0.70
+        min_score_floor: float = 0.25,
+        min_drop_ratio: float = 0.06,
+        high_confidence_retention: float = 0.50
     ) -> int:
         """
         Detects the separation boundary between valid multi-matches and noise.
@@ -449,8 +455,6 @@ class Match:
 
             if verify_nli and r["nli_data"] is not None:
                 if not r["nli_data"]["verified"]:
-                    continue
-                if r["nli_data"]["entailment_prob"] < 0.35:
                     continue
 
             d_idx = r["orig_doc_idx"]
