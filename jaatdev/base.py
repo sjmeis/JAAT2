@@ -13,6 +13,7 @@ CLEAN_PATTERN = re.compile(r"(;|\s\+\s|\s\*\s|\s\-\s|\s•\s|\s·\s|--|\*\*)")
 MULTI_PUNCT = re.compile(r"\.{2,}")
 MULTI_SPACE = re.compile(r"[ \t]+")
 TRAILING_PUNCT = re.compile(r"^[ \t\n\r.\-•*]+|[ \t\n\r.\-•*]+$")
+CLAUSE_DELIMS = re.compile(r"(\s*;\s*|\s*—\s*|\s*--\s*)")
 
 def get_device_settings() -> Tuple[str, int]:
     if torch.cuda.is_available():
@@ -42,7 +43,8 @@ def clean_text(text: str) -> str:
             normalized_lines.append(line)
     text = ". ".join(normalized_lines)
     text = BULLET_PATTERN.sub(" ", text)
-    text = DELIM_PATTERN.sub(". ", text)
+
+    text = CLAUSE_DELIMS.sub(". ", text)
     text = MULTI_PUNCT.sub(".", text)
     text = MULTI_SPACE.sub(" ", text).strip()
     return text
@@ -79,10 +81,10 @@ class BatchedSaTSplitter:
         docs: List[str],
         batch_size: int = 1024,
         pass1_threshold: float = 0.50,
-        pass2_threshold: float = 0.30,
+        pass2_threshold: float = 0.20,
         min_words: int = 2,
-        max_words: int = 64,
-        pass2_char_length: int = 100
+        max_words: int = 48,
+        pass2_char_length: int = 80
     ) -> List[List[str]]:
         if not docs:
             return []
@@ -111,7 +113,7 @@ class BatchedSaTSplitter:
             doc_sentence_groups.append(filtered_doc_sents)
 
             for s_idx, sent in enumerate(filtered_doc_sents):
-                if len(sent) >= pass2_char_length or len(sent.split()) > (max_words // 2):
+                if len(sent) >= pass2_char_length or len(sent.split()) > 15: # > (max_words // 2):
                     pass2_candidates.append(sent)
                     pass2_mapping.append((d_idx, s_idx))
 
@@ -126,9 +128,15 @@ class BatchedSaTSplitter:
             )
 
             for (d_idx, s_idx), refined_sents in zip(pass2_mapping, pass2_results):
-                valid_splits = [s.strip() for s in refined_sents if s.strip()]
-                if len(valid_splits) > 1:
-                    replacement_map[(d_idx, s_idx)] = valid_splits
+                valid_splits = [s.strip(" ,;.-•*") for s in refined_sents if s.strip()]
+                cleaned_splits = []
+                for split in valid_splits:
+                    split_cleaned = re.sub(r"^(and|or|whether that's|whether|such as|including)\s+", "", split, flags=re.IGNORECASE)
+                    if len(split_cleaned.split()) >= min_words:
+                        cleaned_splits.append(split_cleaned)
+
+                if len(cleaned_splits) > 1:
+                    replacement_map[(d_idx, s_idx)] = cleaned_splits
 
         final_docs: List[List[str]] = []
         for d_idx, sents in enumerate(doc_sentence_groups):
