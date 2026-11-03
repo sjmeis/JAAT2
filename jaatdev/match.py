@@ -357,7 +357,7 @@ class Match:
         del fused_cand_gpu
 
         K = self.initial_top_n
-        flat_uq_idx = np.repeat(np.arange(M), K)
+        flat_uq_idx = np.repeat(np.arange(U), K)
         flat_cand_idx = fused_cand_unique.flatten()
 
         ce_pairs = [

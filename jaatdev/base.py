@@ -7,9 +7,12 @@ from wtpsplit import SaT
 
 from .config import logger, MODEL_CACHE
 
+BULLET_PATTERN = re.compile(r"(^|\n)[\s•·\-\*]+\s*")
+DELIM_PATTERN = re.compile(r"[;]\s*")
 CLEAN_PATTERN = re.compile(r"(;|\s\+\s|\s\*\s|\s\-\s|\s•\s|\s·\s|--|\*\*)")
 MULTI_PUNCT = re.compile(r"\.{2,}")
 MULTI_SPACE = re.compile(r"[ \t]+")
+TRAILING_PUNCT = re.compile(r"^[ \t\n\r.\-•*]+|[ \t\n\r.\-•*]+$")
 
 def get_device_settings() -> Tuple[str, int]:
     if torch.cuda.is_available():
@@ -31,16 +34,24 @@ def clean_text(text: str) -> str:
     if not text:
         return ""
     lines = [line.strip() for line in text.split("\n") if line.strip()]
-    text = ". ".join(lines)
-    text = CLEAN_PATTERN.sub(". ", text)
-    text = MULTI_PUNCT.sub(". ", text)
+    normalized_lines = []
+    for line in lines:
+        if line[-1] not in ".!?":
+            normalized_lines.append(line + ".")
+        else:
+            normalized_lines.append(line)
+    text = ". ".join(normalized_lines)
+    text = BULLET_PATTERN.sub(" ", text)
+    text = DELIM_PATTERN.sub(". ", text)
+    text = MULTI_PUNCT.sub(".", text)
     text = MULTI_SPACE.sub(" ", text).strip()
     return text
 
 def filter_valid_sentence(sent: str, min_words: int = 2, max_words: int = 64) -> Optional[str]:
-    s = sent.strip(" \t\n\r.-•*")
-    word_count = len(s.split())
-    if min_words < word_count <= max_words:
+    s = TRAILING_PUNCT.sub("", sent)
+    words = s.split()
+    word_count = len(words)
+    if min_words <= word_count <= max_words:
         return s
     return None
 
@@ -66,12 +77,12 @@ class BatchedSaTSplitter:
     def split_two_pass(
         self,
         docs: List[str],
-        batch_size: int = 256,
+        batch_size: int = 1024,
         pass1_threshold: float = 0.50,
-        pass2_threshold: float = 0.35,
-        min_words: int = 4,
-        max_words: int = 48,
-        pass2_char_length: int = 80
+        pass2_threshold: float = 0.30,
+        min_words: int = 2,
+        max_words: int = 64,
+        pass2_char_length: int = 100
     ) -> List[List[str]]:
         if not docs:
             return []
@@ -103,7 +114,6 @@ class BatchedSaTSplitter:
                 if len(sent) >= pass2_char_length or len(sent.split()) > (max_words // 2):
                     pass2_candidates.append(sent)
                     pass2_mapping.append((d_idx, s_idx))
-
 
         replacement_map: dict[Tuple[int, int], List[str]] = {}
         if pass2_candidates:
