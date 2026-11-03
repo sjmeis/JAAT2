@@ -387,7 +387,10 @@ class Match:
                 batch_size=512,
                 show_progress_bar=GLOBAL_SETTINGS.get("show_progress", True)
             )
-        scaled_scores = 1.0 / (1.0 + np.exp(-raw_ce_preds / max(self.cross_temp, 0.1)))
+        if np.all(raw_ce_preds >= 0.0) and np.all(raw_ce_preds <= 1.0):
+            scaled_scores = raw_ce_preds
+        else:
+            scaled_scores = 1.0 / (1.0 + np.exp(-raw_ce_preds))
 
         unique_query_cand_scores = scaled_scores.reshape(U, K)
 
@@ -423,33 +426,16 @@ class Match:
 
         # Optional NLI Verification
         if verify_nli and self.nli_model and selected_records:
-            nli_candidates = []
-            nli_cand_indices = []
-
-            for idx, r in enumerate(selected_records):
-                if r["score"] >= 0.8: # hard-coded auto-verify!
-                    r["nli_data"] = {
-                        "entailment_prob": 1.0,
-                        "neutral_prob": 0.0,
-                        "contradiction_prob": 0.0,
-                        "margin": 1.0,
-                        "verified": True
-                    }
-                else:
-                    nli_candidates.append((r["text"], r["query_sent"]))
-                    nli_cand_indices.append(idx)
-
-            logger.info("Running verification...")
-            if nli_candidates:
-                nli_scores = self._score_nli_entailment(
-                    nli_candidates,
-                    template=tax.nli_template,
-                    batch_size=1024,
-                    min_entail_prob=0.35,
-                    max_contradiction_prob=0.25
-                )
-                for orig_idx, n_data in zip(nli_cand_indices, nli_scores):
-                    selected_records[orig_idx]["nli_data"] = n_data
+            nli_pairs = [(r["text"], r["query_sent"]) for r in selected_records]
+            nli_scores = self._score_nli_entailment(
+                nli_pairs,
+                template=tax.nli_template,
+                batch_size=512,
+                min_entail_prob=0.40,
+                max_contradiction_prob=0.20
+            )
+            for r, n_data in zip(selected_records, nli_scores):
+                r["nli_data"] = n_data
         else:
             for r in selected_records:
                 r["nli_data"] = None
@@ -458,8 +444,13 @@ class Match:
         logger.info("Aggregating results...")
         aggregated_by_doc: List[Dict[str, Dict[str, Any]]] = [{} for _ in range(len(texts))]
         for r in selected_records:
+            if r["score"] < self.threshold:
+                continue
+
             if verify_nli and r["nli_data"] is not None:
                 if not r["nli_data"]["verified"]:
+                    continue
+                if r["nli_data"]["entailment_prob"] < 0.35:
                     continue
 
             d_idx = r["orig_doc_idx"]
