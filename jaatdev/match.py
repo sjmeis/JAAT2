@@ -61,8 +61,8 @@ class MatchResult:
 class Match:
     def __init__(
         self,
-        embedding_model: str = "sjmeis/skills-embedding-gemma",
-        cross_encoder_model: str = "sjmeis/task-cross-encoder-v1",
+        embedding_model: str = "ibm-granite/granite-embedding-english-r2",
+        cross_encoder_model: str = "mixedbread-ai/mxbai-rerank-base-v1",
         classification_model: str = "sjmeis/skill-classifier-small-v3.5",
         nli_model: Optional[str] = "cross-encoder/nli-deberta-v3-xsmall", #"cross-encoder/nli-deberta-v3-base"
         hf_token: Optional[str] = None,
