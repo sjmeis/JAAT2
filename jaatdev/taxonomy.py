@@ -170,7 +170,8 @@ class Taxonomy:
         self.texts_arr = self.df["text"].to_numpy()
         
         self.ce_targets = [
-            self.cross_encoder_template.format(text=t.lower()) 
+            #self.cross_encoder_template.format(text=t.lower())
+            t.strip()
             for t in self.texts_arr
         ]
 

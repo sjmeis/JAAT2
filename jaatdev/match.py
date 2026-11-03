@@ -50,6 +50,12 @@ def predict_with_length_sorting(
     unsort_indices[sort_indices] = np.arange(len(sort_indices))
     return preds[unsort_indices]
 
+def condition_query(q: str) -> str:
+    words = q.strip().split()
+    if len(words) <= 5 and not any(w.endswith(('.', '!', '?')) for w in words):
+        return f"Experience with {q}"
+    return q
+
 @dataclass
 class MatchResult:
     task_id: str
@@ -62,7 +68,7 @@ class Match:
     def __init__(
         self,
         embedding_model: str = "ibm-granite/granite-embedding-english-r2",
-        cross_encoder_model: str = "mixedbread-ai/mxbai-rerank-base-v1",
+        cross_encoder_model: str = "mixedbread-ai/mxbai-rerank-base-v2",
         classification_model: str = "sjmeis/skill-classifier-small-v3.5",
         nli_model: Optional[str] = "cross-encoder/nli-deberta-v3-xsmall", #"cross-encoder/nli-deberta-v3-base"
         hf_token: Optional[str] = None,
@@ -70,8 +76,8 @@ class Match:
         query_prefix: str = "",
         document_prefix: str = "",
         initial_top_n: int = 25,
-        threshold: float = 0.30,
-        cross_temp: float = 0.1,
+        threshold: float = 0.40,
+        cross_temp: float = 1.0,
     ) -> None:
         logger.info("Initializing Match pipeline...")
         self.device, self.batch_size = get_device_settings()
@@ -180,8 +186,8 @@ class Match:
         template: str,
         batch_size: int = 1024,
         min_nli_margin: float = 0.05,
-        min_entail_prob: float = 0.25,
-        max_contradiction_prob: float = 0.25
+        min_entail_prob: float = 0.30,
+        max_contradiction_prob: float = 0.20
     ) -> List[Dict[str, Any]]:
         """Runs NLI verification: premise (query/sentence), hypothesis (templated task)."""
         if not pairs or not self.nli_model:
@@ -262,9 +268,9 @@ class Match:
     @staticmethod
     def _find_adaptive_elbow(
         scores: List[float],
-        min_score_floor: float = 0.25,
-        min_drop_ratio: float = 0.06,
-        high_confidence_retention: float = 0.50
+        min_score_floor: float = 0.35,
+        min_drop_ratio: float = 0.08,
+        high_confidence_retention: float = 0.70
     ) -> int:
         """
         Detects the separation boundary between valid multi-matches and noise.
