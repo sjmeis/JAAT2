@@ -171,21 +171,8 @@ class Match:
 
         return [
             pair for pair, pred in zip(all_data, predictions) 
-            if pred["label"] in ("LABEL_1", "POSITIVE", "1") and pred["score"] >= 0.75
+            if pred["label"] in ("LABEL_1", "POSITIVE", "1") and pred["score"] >= 0.80
         ]
-
-    def _score_cross_encoder(self, pairs: List[Tuple[str, str]], template: str) -> List[float]:
-        """Expects pairs of (task_desc, context_sent)."""
-        if not pairs or not self.cross_encoder:
-            return []
-        
-        conditioned_pairs = [
-            (ctx, template.format(text=target.lower()))
-            for target, ctx in pairs
-        ]
-        preds = self.cross_encoder.predict(conditioned_pairs)
-        # Scaled sigmoid calibration
-        return [float(1.0 / (1.0 + np.exp(-(float(x) + 1.5) / self.cross_temp))) for x in preds]
 
     def _score_nli_entailment(
         self,
@@ -269,9 +256,9 @@ class Match:
     @staticmethod
     def _find_adaptive_elbow(
         scores: List[float],
-        min_score_floor: float = 0.35,
+        min_score_floor: float = 0.30,
         min_drop_ratio: float = 0.08,
-        high_confidence_retention: float = 0.90
+        high_confidence_retention: float = 0.70
     ) -> int:
         """
         Detects the separation boundary between valid multi-matches and noise.
@@ -281,6 +268,8 @@ class Match:
         """
         if not scores:
             return 0
+        if scores[0] < min_score_floor:
+            return 0
         if len(scores) == 1:
             return 1 if scores[0] >= min_score_floor else 0
 
@@ -288,10 +277,12 @@ class Match:
         valid_indices = np.where(scores_arr >= min_score_floor)[0]
         if len(valid_indices) == 0:
             return 0
+
+        num_valid = len(valid_indices)
+        if num_valid == 1:
+            return 1
         
         active_scores = scores_arr[valid_indices]
-        if len(active_scores) == 1:
-            return 1
 
         drops = -np.diff(active_scores)
         weighted_drops = drops * (active_scores[:-1] ** 1.5)
@@ -300,9 +291,9 @@ class Match:
         if drops[best_drop_idx] >= min_drop_ratio:
             cutoff = best_drop_idx + 1
         else:
-            cutoff = len(active_scores)
+            cutoff = num_valid
 
-        high_conf_count = int(np.sum(scores_arr >= high_confidence_retention))
+        high_conf_count = int(np.sum(active_scores >= high_confidence_retention))
         final_cutoff = max(cutoff, high_conf_count)
 
         return min(final_cutoff, len(scores))
