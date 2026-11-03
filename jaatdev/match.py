@@ -6,12 +6,11 @@ from dataclasses import dataclass
 import multiprocessing as mp
 from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
 from sentence_transformers import SentenceTransformer, CrossEncoder
-from concurrent.futures import ThreadPoolExecutor
 
 from .base import ListDataset, get_device_settings, get_sentence_splitter
 from .config import MODEL_CACHE, logger, GLOBAL_SETTINGS
 from .utils import progress_bar
-from .taxonomy import Taxonomy, load_default_taxonomy, bm25_tokenize
+from .taxonomy import Taxonomy, load_default_taxonomy
 
 def get_shared_model(model_name: str, device: str, token: Optional[str] = None) -> SentenceTransformer:
     if model_name not in MODEL_CACHE:
@@ -26,69 +25,6 @@ def get_shared_cross_encoder(model_name: str, device: str, token: Optional[str] 
     if key not in MODEL_CACHE:
         MODEL_CACHE[key] = CrossEncoder(model_name, device=device, token=token)
     return MODEL_CACHE[key]
-
-def reciprocal_rank_fusion(
-    dense_top_indices: torch.Tensor,
-    bm25_top_indices: np.ndarray,
-    num_candidates: int,
-    k_out: int,
-    rrf_k: int = 60
-) -> List[int]:
-    """Combines dense and lexical rankings using standard RRF."""
-    M, K = dense_top_indices.shape
-    device = dense_top_indices.device
-
-    bm25_tensor = torch.from_numpy(bm25_top_indices).to(device=device, dtype=torch.long)
-
-    ranks = torch.arange(1, K + 1, device=device, dtype=torch.float32)
-    rrf_weights = 1.0 / (rrf_k + ranks)  # Shape (K,)
-
-    fused_scores = torch.zeros((M, num_candidates), device=device, dtype=torch.float32)
-    
-    fused_scores.scatter_add_(1, dense_top_indices, rrf_weights.unsqueeze(0).expand(M, -1))
-    fused_scores.scatter_add_(1, bm25_tensor, rrf_weights.unsqueeze(0).expand(M, -1))
-
-    _, final_top_indices = torch.topk(fused_scores, k=k_out, dim=1)
-    
-    return final_top_indices.cpu().numpy()
-
-def chunked_dense_retrieval(
-    query_embeds: torch.Tensor,
-    tax_embeds: torch.Tensor,
-    k: int,
-    query_chunk_size: int = 4096,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Computes top-k retrieval in query chunks."""
-    all_top_scores = []
-    all_top_indices = []
-
-    for i in range(0, query_embeds.shape[0], query_chunk_size):
-        chunk_q = query_embeds[i:i + query_chunk_size]
-        sim_chunk = torch.mm(chunk_q, tax_embeds.T)
-        scores, indices = torch.topk(sim_chunk, k=k, dim=1)
-        all_top_scores.append(scores.cpu().to(torch.float32).numpy())
-        all_top_indices.append(indices.cpu().numpy())
-        del sim_chunk
-
-    return np.vstack(all_top_scores), np.vstack(all_top_indices)
-
-def _bm25_worker(args):
-    bm25_index, query_text, k = args
-    tokens = bm25_tokenize(query_text)
-    if not tokens:
-        return [0] * k
-    scores = bm25_index.get_scores(tokens)
-    # Fast partial partition
-    if len(scores) <= k:
-        return np.argsort(scores)[::-1].tolist()
-    part = np.argpartition(scores, -k)[-k:]
-    return part[np.argsort(scores[part])[::-1]].tolist()
-
-def bm25_topk(bm25_index, queries: List[str], k: int, num_workers: int = 8) -> List[List[int]]:
-    tasks = [(bm25_index, q, k) for q in queries]
-    with ThreadPoolExecutor(max_workers=num_workers) as pool:
-        results = list(pool.map(_bm25_worker, tasks))
-    return np.array(results, dtype=np.int64)
 
 @dataclass
 class MatchResult:
@@ -138,12 +74,12 @@ class Match:
         # Candidate extraction pipeline
         logger.info("Setting up candidate extraction classifier...")
         self.clf_model = AutoModelForSequenceClassification.from_pretrained(classification_model, token=self.hf_token)
-        self.clf_tokenizer = AutoTokenizer.from_pretrained(classification_model, use_fast=True, max_length=64, truncation=True, token=self.hf_token)
+        self.clf_tokenizer = AutoTokenizer.from_pretrained(classification_model, use_fast=True, max_length=128, truncation=True, token=self.hf_token)
         self.pipe = pipeline(
             "text-classification",
             model=self.clf_model,
             tokenizer=self.clf_tokenizer,
-            max_length=64,
+            max_length=128,
             device=self.device,
             truncation=True,
             batch_size=self.batch_size,
@@ -336,13 +272,15 @@ class Match:
             raise KeyError(f"Taxonomy '{taxonomy_name}' is not registered. Registered: {list(self._taxonomies.keys())}")
 
         tax = self._taxonomies[taxonomy_name]
-        
+
+        logger.info("Extracting candidates...")
         all_data = self.get_candidates_batch(texts)
         results: List[List[Dict[str, Any]]] = [[] for _ in range(len(texts))]
         if not all_data:
             return results
 
         # Embedding coarse search
+        logger.info("Running coarse retrieval...")
         M = len(all_data)
         query_texts = [d[1] for d in all_data]
         doc_indices = np.array([d[0] for d in all_data], dtype=np.int32)
@@ -360,62 +298,67 @@ class Match:
             ).to(self.device)
             q_embed = F.normalize(q_embed, p=2, dim=1)
 
+            k_pool = min(self.initial_top_n * 2, tax.embeddings.shape[0])
             with torch.autocast(device_type="cuda" if use_cuda else "cpu", dtype=autocast_dtype, enabled=use_cuda):
-                k_dense = min(self.initial_top_n * 2, tax.embeddings.shape[0])
-                dense_cand_indices = []
-                for chunk_start in range(0, M, 4096):
-                    sim_chunk = torch.mm(q_embed[chunk_start:chunk_start + 4096], tax.embeddings.T)
-                    _, chunk_top_idx = torch.topk(sim_chunk, k=k_dense, dim=1)
-                    dense_cand_indices.append(chunk_top_idx)
+                sim_matrix = torch.mm(q_embed, tax.embeddings.T)
+                _, dense_top_indices_gpu = torch.topk(sim_matrix, k=k_pool, dim=1)
+            del q_embed, sim_matrix
 
-                dense_top_indices_gpu = torch.cat(dense_cand_indices, dim=0)
+            bm25_top_indices_gpu = tax.bm25.query_topk(query_texts, k=k_pool)
 
-            del q_embed
+            # RRF completely on GPU (No CPU transfers)
+            ranks = torch.arange(1, k_pool + 1, device=self.device, dtype=torch.float32)
+            rrf_weights = 1.0 / (60 + ranks)
 
-        bm25_top_indices = bm25_topk(tax.bm25, query_texts, k=k_dense, num_workers=min(self.num_workers, 16))
+            fused_scores = torch.zeros((M, len(tax.codes_arr)), device=self.device, dtype=torch.float32)
+            fused_scores.scatter_add_(1, dense_top_indices_gpu, rrf_weights.unsqueeze(0).expand(M, -1))
+            fused_scores.scatter_add_(1, bm25_top_indices_gpu, rrf_weights.unsqueeze(0).expand(M, -1))
 
-        fused_cand_indices = reciprocal_rank_fusion(
-            dense_top_indices=dense_top_indices_gpu,
-            bm25_top_indices=bm25_top_indices,
-            num_candidates=len(tax.codes_arr),
-            k_out=self.initial_top_n
-        )
-        del dense_top_indices_gpu
+            _, fused_cand_gpu = torch.topk(fused_scores, k=self.initial_top_n, dim=1)
+            del dense_top_indices_gpu, bm25_top_indices_gpu, fused_scores
 
-        K_pool = self.initial_top_n
-        flat_q_indices = np.repeat(np.arange(M), K_pool)
-        flat_cand_indices = fused_cand_indices.flatten()
+        fused_cand_np = fused_cand_gpu.cpu().numpy()
+        del fused_cand_gpu
 
-        ce_queries = [query_texts[qi] for qi in flat_q_indices]
-        ce_targets = [tax.ce_targets[ci] for ci in flat_cand_indices]
-        ce_pairs = list(zip(ce_queries, ce_targets))
+        K = self.initial_top_n
+        flat_q_idx = np.repeat(np.arange(M), K)
+        flat_cand_idx = fused_cand_np.flatten()
+
+        ce_pairs = [
+            (query_texts[qi], tax.ce_targets[ci]) 
+            for qi, ci in zip(flat_q_idx, flat_cand_idx)
+        ]
 
         # Cross-Encoder Rerank
+        logger.info("Re-ranking...")
         raw_ce_preds = self.cross_encoder.predict(
             ce_pairs,
-            batch_size=256,
+            batch_size=512,
             show_progress_bar=GLOBAL_SETTINGS.get("show_progress", True),
             convert_to_numpy=True
         )
         scaled_scores = 1.0 / (1.0 + np.exp(-(raw_ce_preds + 1.5) / self.cross_temp))
 
-        query_cand_scores = scaled_scores.reshape(M, K_pool)
+        query_cand_scores = scaled_scores.reshape(M, K)
 
         # Apply Cutoff
+        sort_order = np.argsort(-query_cand_scores, axis=1)
+        sorted_scores = np.take_along_axis(query_cand_scores, sort_order, axis=1)
+        sorted_cands = np.take_along_axis(fused_cand_np, sort_order, axis=1)
+
         selected_records = []
         for i in range(M):
-            scores_row = query_cand_scores[i]
-            sort_order = np.argsort(scores_row)[::-1]
-            sorted_scores = scores_row[sort_order]
-            sorted_cands = fused_cand_indices[i][sort_order]
+            row_scores = sorted_scores[i]
+            row_cands = sorted_cands[i]
 
-            cutoff = min(top_k, K_pool) if top_k is not None else self._find_adaptive_elbow(sorted_scores.tolist())
+            cutoff = min(top_k, K) if top_k is not None else self._find_adaptive_elbow(row_scores.tolist())
 
             for rank_idx in range(cutoff):
-                sc = sorted_scores[rank_idx]
+                sc = row_scores[rank_idx]
                 if sc < self.threshold:
-                    continue
-                c_idx = sorted_cands[rank_idx]
+                    break  # all subsequent items are below threshold
+                
+                c_idx = row_cands[rank_idx]
                 selected_records.append({
                     "orig_doc_idx": doc_indices[i],
                     "query_sent": query_texts[i],
@@ -426,12 +369,13 @@ class Match:
 
         # Optional NLI Verification
         if verify_nli and self.nli_model and selected_records:
+            logger.info("Running verification...")
             nli_pairs = [(r["text"], r["query_sent"]) for r in selected_records]
             nli_scores = self._score_nli_entailment(
                 nli_pairs,
                 template=tax.nli_template,
-                batch_size=128,
-                min_nli_margin=0.10
+                batch_size=512,
+                min_nli_margin=0.05
             )
             for r, n_data in zip(selected_records, nli_scores):
                 r["nli_data"] = n_data
@@ -440,11 +384,9 @@ class Match:
                 r["nli_data"] = None
 
         # Filter by minimum confidence and structure output
+        logger.info("Aggregating results...")
         aggregated_by_doc: List[Dict[str, Dict[str, Any]]] = [{} for _ in range(len(texts))]
         for r in selected_records:
-            if r["final_score"] < self.threshold:
-                continue
-
             if verify_nli and r["nli_data"] is not None:
                 if not r["nli_data"]["verified"]:
                     continue
