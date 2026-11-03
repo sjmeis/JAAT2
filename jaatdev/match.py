@@ -75,8 +75,8 @@ class Match:
         default_taxonomies: Optional[List[str]] = ("tasks", "skills", "ai"),
         query_prefix: str = "",
         document_prefix: str = "",
-        initial_top_n: int = 25,
-        threshold: float = 0.40,
+        initial_top_n: int = 50,
+        threshold: float = 0.70,
         cross_temp: float = 1.0,
     ) -> None:
         logger.info("Initializing Match pipeline...")
@@ -399,10 +399,17 @@ class Match:
                 batch_size=512,
                 show_progress_bar=GLOBAL_SETTINGS.get("show_progress", True)
             )
-        if np.all(raw_ce_preds >= 0.0) and np.all(raw_ce_preds <= 1.0):
-            scaled_scores = raw_ce_preds
+        raw_arr = np.asarray(raw_ce_preds, dtype=np.float32)
+        if np.all(raw_arr >= 0.0) and np.all(raw_arr <= 1.0):
+            if abs(self.cross_temp - 1.0) > 1e-3:
+                eps = 1e-7
+                clipped = np.clip(raw_arr, eps, 1.0 - eps)
+                logits = np.log(clipped / (1.0 - clipped))
+                scaled_scores = 1.0 / (1.0 + np.exp(-logits / self.cross_temp))
+            else:
+                scaled_scores = raw_arr
         else:
-            scaled_scores = 1.0 / (1.0 + np.exp(-raw_ce_preds))
+            scaled_scores = 1.0 / (1.0 + np.exp(-raw_arr / max(self.cross_temp, 0.1)))
 
         unique_query_cand_scores = scaled_scores.reshape(U, K)
 
