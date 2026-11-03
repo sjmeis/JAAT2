@@ -70,8 +70,8 @@ class Match:
         query_prefix: str = "",
         document_prefix: str = "",
         initial_top_n: int = 25,
-        threshold: float = 0.50,
-        cross_temp: float = 1.0,
+        threshold: float = 0.65,
+        cross_temp: float = 0.1,
     ) -> None:
         logger.info("Initializing Match pipeline...")
         self.device, self.batch_size = get_device_settings()
@@ -171,7 +171,7 @@ class Match:
 
         return [
             pair for pair, pred in zip(all_data, predictions) 
-            if pred["label"] in ("LABEL_1", "POSITIVE", "1")
+            if pred["label"] in ("LABEL_1", "POSITIVE", "1") and pred["score"] >= 0.75
         ]
 
     def _score_cross_encoder(self, pairs: List[Tuple[str, str]], template: str) -> List[float]:
@@ -396,7 +396,7 @@ class Match:
                 batch_size=512,
                 show_progress_bar=GLOBAL_SETTINGS.get("show_progress", True)
             )
-        scaled_scores = 1.0 / (1.0 + np.exp(-(raw_ce_preds + 1.5) / self.cross_temp))
+        scaled_scores = 1.0 / (1.0 + np.exp(-raw_ce_preds / max(self.cross_temp, 0.1)))
 
         unique_query_cand_scores = scaled_scores.reshape(U, K)
 
