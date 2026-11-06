@@ -156,7 +156,22 @@ class Match:
 
     def _init_nli(self, nli_model_name: str) -> None:
         self.nli_tokenizer = AutoTokenizer.from_pretrained(nli_model_name, use_fast=True)
-        self.nli_model = AutoModelForSequenceClassification.from_pretrained(nli_model_name, token=self.hf_token, attn_implementation=self.attn_backend).to(self.device)
+
+        is_deberta = "deberta" in nli_model_name.lower()
+        attn_backend = "eager" if is_deberta else self.attn_backend
+
+        torch_dtype = (
+            torch.bfloat16
+            if (torch.cuda.is_available() and torch.cuda.is_bf16_supported())
+            else torch.float16
+        )
+
+        self.nli_model = AutoModelForSequenceClassification.from_pretrained(
+                nli_model_name,
+                token=self.hf_token,
+                dtype=torch_dtype,
+                attn_implementation=attn_backend
+            ).to(self.device)
         self.nli_model.eval()
 
         id2label = {v.lower(): k for k, v in self.nli_model.config.id2label.items()}
