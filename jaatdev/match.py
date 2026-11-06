@@ -516,9 +516,8 @@ class Match:
 
         # Optional NLI Verification
         if verify_nli and self.nli_model and selected_records:
-            nli_pairs = [(r["text"], r["query_sent"]) for r in selected_records]
             nli_scores = self._score_nli_entailment(
-                nli_pairs,
+                selected_records,
                 tax=tax,
                 batch_size=1024,
                 min_entail_prob=0.40,
