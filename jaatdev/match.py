@@ -454,11 +454,11 @@ class Match:
                 fused_scores = torch.zeros((sub_M, len(tax.codes_arr)), device=self.device, dtype=torch.float32)
                 fused_scores.scatter_add_(1, combined_cands, combined_weights)
                 _, sub_fused = torch.topk(fused_scores, k=self.initial_top_n, dim=1)
-                
+
                 fused_cand_gpu[uncertain_indices] = sub_fused
                 del fused_scores, bm25_top_indices_gpu, combined_cands, combined_weights
 
-            dense_top_scores_cpu = dense_top_scores[:, :self.initial_top_n].cpu().numpy()
+            dense_top_scores_cpu = dense_top_scores[:, :self.initial_top_n].to(torch.float32).cpu().numpy()
             del dense_top_scores, dense_top_indices_gpu
 
         fused_cand_unique = fused_cand_gpu.cpu().numpy()
