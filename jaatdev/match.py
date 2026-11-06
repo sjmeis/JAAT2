@@ -119,7 +119,7 @@ class Match:
                 attn_implementation=self.attn_backend,
             ).to(self.device)
         self.clf_model.eval()
-        self.clf_tokenizer = AutoTokenizer.from_pretrained(classification_model, use_fast=True, max_length=128, truncation=True, token=self.hf_token)
+        self.clf_tokenizer = AutoTokenizer.from_pretrained(classification_model, use_fast=True, max_length=64, truncation=True, token=self.hf_token)
 
         # Cross-Encoder Reranker
         self.cross_encoder = None
@@ -208,7 +208,7 @@ class Match:
                     batch_texts,
                     padding=True,
                     truncation=True,
-                    max_length=128,
+                    max_length=64,
                     return_tensors="pt"
                 ).to(self.device)
 
@@ -434,6 +434,7 @@ class Match:
                 del fused_scores, bm25_top_indices_gpu, combined_cands, combined_weights
 
             dense_top_scores_cpu = dense_top_scores[:, :self.initial_top_n].to(torch.float32).cpu().numpy()
+            dense_top_indices_cpu = dense_top_indices_gpu[:, :self.initial_top_n].cpu().numpy()
             del dense_top_scores, dense_top_indices_gpu
 
         fused_cand_unique = fused_cand_gpu.cpu().numpy()
@@ -453,7 +454,12 @@ class Match:
             
             for rank_pos in range(K):
                 c_idx = fused_cand_unique[u_i, rank_pos]
-                bi_score = float(dense_top_scores_cpu[u_i, rank_pos])
+                dense_matches = np.where(dense_top_indices_cpu[u_i] == c_idx)[0]
+                bi_score = (
+                    float(dense_top_scores_cpu[u_i, dense_matches[0]])
+                    if len(dense_matches) > 0
+                    else 0.0
+                )
 
                 if rank_pos < MIN_KEEP_TOP_N or bi_score >= DENSE_SCORE_FLOOR:
                     ce_pairs.append((conditioned_q, tax.ce_targets[c_idx]))
@@ -554,8 +560,6 @@ class Match:
                 "sentence": r["query_sent"],
                 "score": curr_score,
             }
-            if return_original:
-                evidence_item["sentence"] = r["query_sent"]
             if verify_nli:
                 evidence_item["verification_score"] = v_score
 

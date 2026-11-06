@@ -73,6 +73,8 @@ class GPUBM25:
         self.doc_matrix_t = torch.sparse_coo_tensor(
             indices, values, size=(self.vocab_size, self.corpus_size), device=self.device
         ).coalesce()
+        self.doc_matrix_dense = self.doc_matrix_t.to_dense().to(dtype=torch.float16)
+        del self.doc_matrix_t
 
     def query_topk(self, queries: List[str], k: int) -> torch.Tensor:
         """
@@ -103,7 +105,7 @@ class GPUBM25:
             q_indices, q_values, size=(M, self.vocab_size), device=self.device
         ).coalesce()
 
-        scores = torch.sparse.mm(query_sparse, self.doc_matrix_t.to_dense())
+        scores = torch.sparse.mm(query_sparse, self.doc_matrix_dense.to(torch.float32))
 
         _, top_indices = torch.topk(scores, k=k_clamped, dim=1)
         return top_indices

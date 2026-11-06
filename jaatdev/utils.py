@@ -39,7 +39,7 @@ def setup() -> None:
     ]
     
     missing_files = []
-    data_path = impresources.files("JAAT.data")
+    data_path = impresources.files("jaatdev.data")
     for filename in required_files:
         if not (data_path / filename).is_file():
             missing_files.append(filename)
@@ -118,7 +118,7 @@ def toggle_progress(show: bool) -> None:
 def toggle_threads(single_threaded: bool) -> None:
     """Globally enable or disable single-threaded pipelines."""
     GLOBAL_SETTINGS["single_threaded"] = single_threaded
-    status = "single threaded: True" if single_threaded else "single threaded: True"
+    status = f"Single threaded: {single_threaded}"
     logger.info("JAAT setting updated | {}.".format(status))
 
 def progress_bar(iterable: Iterable[Any], desc: str = "Processing", **kwargs) -> Iterable[Any]:

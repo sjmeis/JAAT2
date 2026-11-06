@@ -104,13 +104,12 @@ def clean_text(text: str) -> str:
     if not text:
         return ""
     lines = [line.strip() for line in text.split("\n") if line.strip()]
-    normalized_lines = []
-    for line in lines:
-        if line[-1] not in ".!?":
-            normalized_lines.append(line + ".")
-        else:
-            normalized_lines.append(line)
-    text = ". ".join(normalized_lines)
+    normalized_lines = [
+        line if line.endswith((".", "!", "?")) else f"{line}."
+        for line in (l.strip() for l in text.splitlines())
+        if line
+    ]
+    text = " ".join(normalized_lines)
     text = BULLET_PATTERN.sub(" ", text)
 
     text = CLAUSE_DELIMS.sub(". ", text)
