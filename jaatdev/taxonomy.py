@@ -176,10 +176,10 @@ class Taxonomy:
             for t in self.texts_arr
         ]
 
-        self.nli_hypotheses = {
-            code: self.nli_template.format(text=text.lower().strip())
-            for code, text in zip(self.codes_arr, self.texts_arr)
-        }
+        self.nli_hypotheses = [
+            self.nli_template.format(text=t.strip().lower())
+            for t in self.texts_arr
+        ]
 
         self.bm25 = GPUBM25(self.texts_arr.tolist(), device="cuda" if torch.cuda.is_available() else "cpu")
 

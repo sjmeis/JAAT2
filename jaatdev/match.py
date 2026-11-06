@@ -248,7 +248,7 @@ class Match:
         pair_to_idx = {}
         for p in pairs:
             premise = p["query_sent"]
-            hypothesis = tax.nli_hypotheses[p["tax_idx"]]
+            hypothesis = tax.nli_hypotheses[int(p["tax_idx"])]
             pair = (premise, hypothesis)
 
             if pair not in pair_to_idx:
