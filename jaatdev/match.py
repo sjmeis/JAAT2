@@ -12,9 +12,9 @@ from .config import MODEL_CACHE, logger, GLOBAL_SETTINGS
 from .utils import progress_bar
 from .taxonomy import Taxonomy, load_default_taxonomy
 
-def get_shared_model(model_name: str, device: str, token: Optional[str] = None) -> SentenceTransformer:
+def get_shared_model(model_name: str, device: str, dtype: str, token: Optional[str] = None) -> SentenceTransformer:
     if model_name not in MODEL_CACHE:
-        model = SentenceTransformer(model_name, device=device, token=token)
+        model = SentenceTransformer(model_name, device=device, dtype=dtype, token=token)
         model.max_seq_length = 128
         model.tokenizer.model_max_length = 128
         MODEL_CACHE[model_name] = model
@@ -130,7 +130,7 @@ class Match:
         # Bi-encoder and task embeddings
         logger.info("Setting up bi-encoder and taxonomies...")
         self.embedding_model_name = embedding_model
-        self.embedding_model = get_shared_model(embedding_model, self.device, token=self.hf_token, dtype=torch_dtype)
+        self.embedding_model = get_shared_model(embedding_model, self.device, dtype=torch_dtype, token=self.hf_token)
 
         self._taxonomies: Dict[str, Taxonomy] = {}
         if default_taxonomies:
