@@ -34,7 +34,8 @@ def cross_encoder_predict(
     pairs: List[Tuple[str, str]],
     batch_size: int = 1024,
     max_length: int = 72,
-    device: str = "cuda"
+    device: str = "cuda",
+    show_progress_bar: bool = True
 ) -> np.ndarray:
     """Direct batched execution of CE."""
     if not pairs:
@@ -50,9 +51,24 @@ def cross_encoder_predict(
     sorted_t = [pairs[i][1] for i in sort_order]
 
     all_scores = []
-    autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    use_cuda = "cuda" in str(device)
+    autocast_dtype = torch.bfloat16 if (use_cuda and torch.cuda.is_bf16_supported()) else torch.float16
 
-    for i in range(0, len(pairs), batch_size):
+    num_pairs = len(pairs)
+    total_batches = (num_pairs + batch_size - 1) // batch_size
+    batch_range = range(0, num_pairs, batch_size)
+
+    pbar = (
+        progress_bar(
+            batch_range,
+            total=total_batches,
+            desc="Cross-Encoder Reranking",
+        )
+        if show_progress_bar
+        else batch_range
+    )
+
+    for i in pbar:
         b_q = sorted_q[i:i + batch_size]
         b_t = sorted_t[i:i + batch_size]
 
@@ -65,7 +81,7 @@ def cross_encoder_predict(
             return_tensors="pt"
         ).to(device)
 
-        with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+        with torch.autocast(device_type="cuda" if use_cuda else "cpu", dtype=autocast_dtype, enabled=use_cuda):
             logits = hf_model(**encoded).logits
             if logits.shape[-1] == 2:
                 probs = F.softmax(logits, dim=-1)[:, 1]
