@@ -102,7 +102,7 @@ class Match:
         classification_model: str = "sjmeis/skill-classifier-small-v3.5",
         nli_model: Optional[str] = "cross-encoder/nli-deberta-v3-xsmall", #"cross-encoder/nli-deberta-v3-base"
         hf_token: Optional[str] = None,
-        default_taxonomies: Optional[List[str]] = ("tasks", "skills", "ai"),
+        default_taxonomies: Optional[List[str]] = ("tasks", "skills", "ai", "title"),
         query_prefix: str = "",
         document_prefix: str = "",
         initial_top_n: int = 25,
@@ -121,10 +121,16 @@ class Match:
         self.cross_temp = cross_temp
         self.hf_token = hf_token
 
+        torch_dtype = (
+            torch.bfloat16
+            if (torch.cuda.is_available() and torch.cuda.is_bf16_supported())
+            else torch.float16
+        )
+
         # Bi-encoder and task embeddings
         logger.info("Setting up bi-encoder and taxonomies...")
         self.embedding_model_name = embedding_model
-        self.embedding_model = get_shared_model(embedding_model, self.device, token=self.hf_token)
+        self.embedding_model = get_shared_model(embedding_model, self.device, token=self.hf_token, dtype=torch_dtype)
 
         self._taxonomies: Dict[str, Taxonomy] = {}
         if default_taxonomies:
@@ -134,7 +140,13 @@ class Match:
 
         # Candidate extraction pipeline
         logger.info("Setting up candidate extraction classifier...")
-        self.clf_model = AutoModelForSequenceClassification.from_pretrained(classification_model, token=self.hf_token, attn_implementation=self.attn_backend)
+        self.clf_model = AutoModelForSequenceClassification.from_pretrained(
+                classification_model,
+                token=self.hf_token,
+                torch_dtype=torch_dtype,
+                attn_implementation=self.attn_backend,
+            ).to(self.device)
+        self.clf_model.eval()
         self.clf_tokenizer = AutoTokenizer.from_pretrained(classification_model, use_fast=True, max_length=128, truncation=True, token=self.hf_token)
 
         # Cross-Encoder Reranker
