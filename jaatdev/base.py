@@ -3,7 +3,6 @@ import psutil
 from typing import List, Tuple, Any, Optional
 import torch
 import re
-import importlib.util
 from torch.utils.data import Dataset
 from transformers.utils import is_flash_attn_2_available
 from wtpsplit import SaT
