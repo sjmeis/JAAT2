@@ -33,69 +33,28 @@ def cross_encoder_predict(
     cross_encoder: CrossEncoder,
     pairs: List[Tuple[str, str]],
     batch_size: int = 1024,
-    max_length: int = 72,
-    device: str = "cuda",
     show_progress_bar: bool = True
 ) -> np.ndarray:
     """Direct batched execution of CE."""
     if not pairs:
         return np.array([], dtype=np.float32)
 
-    hf_model = cross_encoder.model
-    hf_tokenizer = cross_encoder.tokenizer
-
     lengths = [len(p[0]) + len(p[1]) for p in pairs]
     sort_order = np.argsort(lengths)
 
-    sorted_q = [pairs[i][0] for i in sort_order]
-    sorted_t = [pairs[i][1] for i in sort_order]
-
-    all_scores = []
-    use_cuda = "cuda" in str(device)
-    autocast_dtype = torch.bfloat16 if (use_cuda and torch.cuda.is_bf16_supported()) else torch.float16
-
-    num_pairs = len(pairs)
-    total_batches = (num_pairs + batch_size - 1) // batch_size
-    batch_range = range(0, num_pairs, batch_size)
-
-    pbar = (
-        progress_bar(
-            batch_range,
-            total=total_batches,
-            desc="Cross-Encoder Reranking",
-        )
-        if show_progress_bar
-        else batch_range
+    sorted_pairs = [pairs[i] for i in sort_order]
+    scores = cross_encoder.predict(
+        sorted_pairs,
+        batch_size=batch_size,
+        show_progress_bar=show_progress_bar,
+        convert_to_numpy=True
     )
 
-    for i in pbar:
-        b_q = sorted_q[i:i + batch_size]
-        b_t = sorted_t[i:i + batch_size]
+    scores = np.asarray(scores, dtype=np.float32).reshape(-1)
 
-        encoded = hf_tokenizer(
-            b_q,
-            b_t,
-            padding=True,
-            truncation=True,
-            max_length=max_length,
-            return_tensors="pt"
-        ).to(device)
-
-        with torch.autocast(device_type="cuda" if use_cuda else "cpu", dtype=autocast_dtype, enabled=use_cuda):
-            logits = hf_model(**encoded).logits
-            if logits.shape[-1] == 2:
-                probs = F.softmax(logits, dim=-1)[:, 1]
-            elif logits.shape[-1] == 1:
-                probs = torch.sigmoid(logits.squeeze(-1))
-            else:
-                probs = logits.squeeze(-1)
-
-        all_scores.append(probs.cpu().to(torch.float32).numpy())
-
-    concat_scores = np.concatenate(all_scores)
     unsort = np.empty_like(sort_order)
     unsort[sort_order] = np.arange(len(sort_order))
-    return concat_scores[unsort]
+    return scores[unsort]
 
 def condition_query(q: str) -> str:
     words = q.strip().split()
