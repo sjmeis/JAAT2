@@ -1,0 +1,9 @@
+JAATv2 (Job Ad Analysis Toolkit)
+Copyright 2026 Stephen Meisenbacher
+
+This product includes software developed by @sjmeis.
+
+This distribution bundles datasets derived from:
+- O*NET Database (U.S. Department of Labor's Employment and Training Administration)
+- ESCO (European Commission)
+See DATA_LICENSES.md for full licensing terms and attribution notices for packaged data.

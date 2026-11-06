@@ -7,6 +7,7 @@ name = "jaat2"
 version = "2.0.0"
 description = "JAATv2: the new and improved Job Ad Anaylsis Toolkit"
 readme = {file = "README.md", content-type = "text/markdown"}
+license = { text = "Apache-2.0" }
 authors = [
   {name = "Stephen Meisenbacher", email = "sjmeis@gtgd.com"}
 ]
@@ -15,8 +16,9 @@ maintainers = [
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent"
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence"
 ]
 requires-python = ">= 3.10"
 dependencies = [
