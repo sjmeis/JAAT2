@@ -7,7 +7,7 @@ import multiprocessing as mp
 from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
 from sentence_transformers import SentenceTransformer, CrossEncoder
 
-from .base import ListDataset, get_device_settings, get_sentence_splitter
+from .base import get_device_settings, get_sentence_splitter, get_optimal_attn_implementation
 from .config import MODEL_CACHE, logger, GLOBAL_SETTINGS
 from .utils import progress_bar
 from .taxonomy import Taxonomy, load_default_taxonomy
@@ -20,35 +20,65 @@ def get_shared_model(model_name: str, device: str, token: Optional[str] = None) 
         MODEL_CACHE[model_name] = model
     return MODEL_CACHE[model_name]
 
-def get_shared_cross_encoder(model_name: str, device: str, token: Optional[str] = None) -> CrossEncoder:
+def get_shared_cross_encoder(model_name: str, device: str, token: Optional[str] = None, attn_backend: str = "sdpa") -> CrossEncoder:
     key = f"ce_{model_name}"
+    torch_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
     if key not in MODEL_CACHE:
-        MODEL_CACHE[key] = CrossEncoder(model_name, device=device, token=token)
+        MODEL_CACHE[key] = CrossEncoder(model_name, device=device, token=token, model_kwargs={"attn_implementation": attn_backend, "dtype": torch_dtype})
     return MODEL_CACHE[key]
 
-def predict_with_length_sorting(
+@torch.inference_mode()
+def cross_encoder_predict(
     cross_encoder: CrossEncoder,
     pairs: List[Tuple[str, str]],
-    batch_size: int = 512,
-    show_progress_bar: bool = True
+    batch_size: int = 1024,
+    max_length: int = 72,
+    device: str = "cuda"
 ) -> np.ndarray:
+    """Direct batched execution of CE."""
     if not pairs:
         return np.array([], dtype=np.float32)
 
+    hf_model = cross_encoder.model
+    hf_tokenizer = cross_encoder.tokenizer
+
     lengths = [len(p[0]) + len(p[1]) for p in pairs]
-    sort_indices = np.argsort(lengths)
-    sorted_pairs = [pairs[i] for i in sort_indices]
+    sort_order = np.argsort(lengths)
 
-    preds = cross_encoder.predict(
-        sorted_pairs,
-        batch_size=batch_size,
-        show_progress_bar=show_progress_bar,
-        convert_to_numpy=True
-    )
+    sorted_q = [pairs[i][0] for i in sort_order]
+    sorted_t = [pairs[i][1] for i in sort_order]
 
-    unsort_indices = np.empty_like(sort_indices)
-    unsort_indices[sort_indices] = np.arange(len(sort_indices))
-    return preds[unsort_indices]
+    all_scores = []
+    autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+    for i in range(0, len(pairs), batch_size):
+        b_q = sorted_q[i:i + batch_size]
+        b_t = sorted_t[i:i + batch_size]
+
+        encoded = hf_tokenizer(
+            b_q,
+            b_t,
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt"
+        ).to(device)
+
+        with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+            logits = hf_model(**encoded).logits
+            if logits.shape[-1] == 2:
+                probs = F.softmax(logits, dim=-1)[:, 1]
+            elif logits.shape[-1] == 1:
+                probs = torch.sigmoid(logits.squeeze(-1))
+            else:
+                probs = logits.squeeze(-1)
+
+        all_scores.append(probs.cpu().to(torch.float32).numpy())
+
+    concat_scores = np.concatenate(all_scores)
+    unsort = np.empty_like(sort_order)
+    unsort[sort_order] = np.arange(len(sort_order))
+    return concat_scores[unsort]
 
 def condition_query(q: str) -> str:
     words = q.strip().split()
@@ -82,6 +112,7 @@ class Match:
         logger.info("Initializing Match pipeline...")
         self.device, self.batch_size = get_device_settings()
         self.num_workers = 1 if GLOBAL_SETTINGS.get("single_threaded", False) else int(mp.cpu_count() / 2)
+        self.attn_backend = get_optimal_attn_implementation()
 
         self.threshold = threshold
         self.initial_top_n = initial_top_n
@@ -103,24 +134,14 @@ class Match:
 
         # Candidate extraction pipeline
         logger.info("Setting up candidate extraction classifier...")
-        self.clf_model = AutoModelForSequenceClassification.from_pretrained(classification_model, token=self.hf_token)
+        self.clf_model = AutoModelForSequenceClassification.from_pretrained(classification_model, token=self.hf_token, attn_implementation=self.attn_backend)
         self.clf_tokenizer = AutoTokenizer.from_pretrained(classification_model, use_fast=True, max_length=128, truncation=True, token=self.hf_token)
-        self.pipe = pipeline(
-            "text-classification",
-            model=self.clf_model,
-            tokenizer=self.clf_tokenizer,
-            max_length=128,
-            device=self.device,
-            truncation=True,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers
-        )
 
         # Cross-Encoder Reranker
         self.cross_encoder = None
         if cross_encoder_model:
             logger.info(f"Loading Cross-Encoder reranker: {cross_encoder_model}...")
-            self.cross_encoder = get_shared_cross_encoder(cross_encoder_model, self.device, token=self.hf_token)
+            self.cross_encoder = get_shared_cross_encoder(cross_encoder_model, self.device, token=self.hf_token, attn_backend=self.attn_backend)
 
         # NLI Model for verification
         self.nli_tokenizer = None
@@ -135,7 +156,7 @@ class Match:
 
     def _init_nli(self, nli_model_name: str) -> None:
         self.nli_tokenizer = AutoTokenizer.from_pretrained(nli_model_name, use_fast=True)
-        self.nli_model = AutoModelForSequenceClassification.from_pretrained(nli_model_name, token=self.hf_token).to(self.device)
+        self.nli_model = AutoModelForSequenceClassification.from_pretrained(nli_model_name, token=self.hf_token, attn_implementation=self.attn_backend).to(self.device)
         self.nli_model.eval()
 
         id2label = {v.lower(): k for k, v in self.nli_model.config.id2label.items()}
@@ -166,24 +187,55 @@ class Match:
         if not all_data:
             return []
 
-        dataset = ListDataset([x[1] for x in all_data])
-        predictions = [
-            r for r in progress_bar(
-                self.pipe(dataset),
-                total=len(all_data),
-                desc="Classifying candidate sentences"
-            )
-        ]
+        raw_sentences = [p[1] for p in all_data]
+        unique_sents, inverse_idx = np.unique(raw_sentences, return_inverse=True)
+        num_unique = len(unique_sents)
 
-        return [
-            pair for pair, pred in zip(all_data, predictions) 
-            if pred["label"] in ("LABEL_1", "POSITIVE", "1") and pred["score"] >= 0.80
-        ]
+        predictions = []
+        use_cuda = "cuda" in str(self.device)
+        autocast_dtype = torch.bfloat16 if (use_cuda and torch.cuda.is_bf16_supported()) else torch.float16
+    
+        total_batches = (num_unique + self.batch_size - 1) // self.batch_size
+        pbar = progress_bar(
+            range(0, num_unique, self.batch_size),
+            total=total_batches,
+            desc="Classifying sentences",
+        )
+
+        with torch.inference_mode():
+            for b_start in pbar:
+                batch_texts = unique_sents[b_start:b_start + self.batch_size].tolist()
+                inputs = self.clf_tokenizer(
+                    batch_texts,
+                    padding=True,
+                    truncation=True,
+                    max_length=128,
+                    return_tensors="pt"
+                ).to(self.device)
+
+                with torch.autocast(device_type="cuda" if use_cuda else "cpu", dtype=autocast_dtype):
+                    logits = self.clf_model(**inputs).logits
+                    probs = F.softmax(logits, dim=-1)
+
+                pos_probs = probs[:, 1].cpu().numpy()
+                for p in pos_probs:
+                    predictions.append({
+                        "label": "LABEL_1" if p >= 0.50 else "LABEL_0",
+                        "score": float(p)
+                    })
+
+        filtered: List[Tuple[int, str]] = []
+        for i, (doc_idx, sent) in enumerate(all_data):
+            pred = predictions[inverse_idx[i]]
+            if pred["label"] in ("LABEL_1", "POSITIVE", "1") and pred["score"] >= 0.80:
+                filtered.append((doc_idx, sent))
+
+        return filtered
 
     def _score_nli_entailment(
         self,
         pairs: List[Tuple[str, str]],
-        template: str,
+        tax: Taxonomy,
         batch_size: int = 1024,
         min_nli_margin: float = 0.05,
         min_entail_prob: float = 0.50,
@@ -196,13 +248,17 @@ class Match:
         unique_pairs, inverse_indices = [], []
         pair_to_idx = {}
         for p in pairs:
-            if p not in pair_to_idx:
-                pair_to_idx[p] = len(unique_pairs)
-                unique_pairs.append(p)
-            inverse_indices.append(pair_to_idx[p])
+            premise = p["query_sent"]
+            hypothesis = tax.nli_hypotheses[p["tax_idx"]]
+            pair = (premise, hypothesis)
 
-        premises = [ctx for _, ctx in unique_pairs]
-        hypotheses = [template.format(text=target.lower().strip()) for target, _ in unique_pairs]
+            if pair not in pair_to_idx:
+                pair_to_idx[pair] = len(unique_pairs)
+                unique_pairs.append(pair)
+            inverse_indices.append(pair_to_idx[pair])
+
+        premises = [p for p, _ in unique_pairs]
+        hypotheses = [h for _, h in unique_pairs]
         num_unique = len(unique_pairs)
 
         lengths = [len(p) + len(h) for p, h in zip(premises, hypotheses)]
@@ -365,34 +421,50 @@ class Match:
                 sub_dense = dense_top_indices_gpu[uncertain_indices]
                 sub_M = len(uncertain_indices)
 
+                combined_cands = torch.cat([sub_dense, bm25_top_indices_gpu], dim=1)
+                
                 ranks = torch.arange(1, k_pool + 1, device=self.device, dtype=torch.float32)
-                rrf_weights = 1.0 / (60 + ranks)
+                rrf_weights = 1.0 / (60.0 + ranks)
+                combined_weights = torch.cat([rrf_weights, rrf_weights]).unsqueeze(0).expand(sub_M, -1)
 
                 fused_scores = torch.zeros((sub_M, len(tax.codes_arr)), device=self.device, dtype=torch.float32)
-                fused_scores.scatter_add_(1, sub_dense, rrf_weights.unsqueeze(0).expand(sub_M, -1))
-                fused_scores.scatter_add_(1, bm25_top_indices_gpu, rrf_weights.unsqueeze(0).expand(sub_M, -1))
-
+                fused_scores.scatter_add_(1, combined_cands, combined_weights)
                 _, sub_fused = torch.topk(fused_scores, k=self.initial_top_n, dim=1)
+
+                fused_cand_gpu[uncertain_indices] = sub_fused
+                del fused_scores, combined_cands, combined_weights
                 fused_cand_gpu[uncertain_indices] = sub_fused
                 del fused_scores, bm25_top_indices_gpu
 
+            dense_top_scores_cpu = dense_top_scores[:, :self.initial_top_n].cpu().numpy()
             del dense_top_scores, dense_top_indices_gpu
 
         fused_cand_unique = fused_cand_gpu.cpu().numpy()
         del fused_cand_gpu
 
+        # prune low-confidence dense matches to save CE runtime, keep MIN (10)
         K = self.initial_top_n
-        flat_uq_idx = np.repeat(np.arange(U), K)
-        flat_cand_idx = fused_cand_unique.flatten()
+        MIN_KEEP_TOP_N = min(10, K)
+        DENSE_SCORE_FLOOR = 0.40
 
-        ce_pairs = [
-            (unique_queries[qi], tax.ce_targets[ci]) 
-            for qi, ci in zip(flat_uq_idx, flat_cand_idx)
-        ]
+        ce_pairs: List[Tuple[str, str]] = []
+        surviving_coords: List[Tuple[int, int]] = []
+
+        for u_i in range(U):
+            q_text = unique_queries[u_i]
+            conditioned_q = condition_query(q_text)
+            
+            for rank_pos in range(K):
+                c_idx = fused_cand_unique[u_i, rank_pos]
+                bi_score = float(dense_top_scores_cpu[u_i, rank_pos])
+
+                if rank_pos < MIN_KEEP_TOP_N or bi_score >= DENSE_SCORE_FLOOR:
+                    ce_pairs.append((conditioned_q, tax.ce_targets[c_idx]))
+                    surviving_coords.append((u_i, rank_pos))
 
         # Cross-Encoder Rerank
         logger.info("Re-ranking...")
-        raw_ce_preds = predict_with_length_sorting(
+        raw_ce_preds = cross_encoder_predict(
                 self.cross_encoder,
                 ce_pairs,
                 batch_size=512,
@@ -410,7 +482,9 @@ class Match:
         else:
             scaled_scores = 1.0 / (1.0 + np.exp(-raw_arr / max(self.cross_temp, 0.1)))
 
-        unique_query_cand_scores = scaled_scores.reshape(U, K)
+        unique_query_cand_scores = np.zeros((U, K), dtype=np.float32)
+        for (u_i, rank_pos), score in zip(surviving_coords, scaled_scores):
+            unique_query_cand_scores[u_i, rank_pos] = score
 
         # Apply Cutoff
         M = len(all_data)
@@ -437,6 +511,7 @@ class Match:
                 selected_records.append({
                     "orig_doc_idx": doc_indices[i],
                     "query_sent": raw_query_texts[i],
+                    "tax_idx": c_idx,
                     "code": tax.codes_arr[c_idx],
                     "text": tax.texts_arr[c_idx],
                     "score": float(sc)
@@ -447,8 +522,8 @@ class Match:
             nli_pairs = [(r["text"], r["query_sent"]) for r in selected_records]
             nli_scores = self._score_nli_entailment(
                 nli_pairs,
-                template=tax.nli_template,
-                batch_size=512,
+                tax=tax,
+                batch_size=1024,
                 min_entail_prob=0.40,
                 max_contradiction_prob=0.20
             )
@@ -560,8 +635,6 @@ class Match:
                 yield doc_result
 
             del chunk_results
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
     def match(
         self,

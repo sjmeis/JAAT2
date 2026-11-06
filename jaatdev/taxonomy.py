@@ -10,7 +10,6 @@ import torch
 import torch.nn.functional as F
 from sentence_transformers import SentenceTransformer
 import importlib_resources as impresources
-from rank_bm25 import BM25Okapi
 
 from .config import logger, GLOBAL_SETTINGS
 
@@ -151,7 +150,10 @@ class Taxonomy:
 
     def __post_init__(self):
         if isinstance(self.data_source, (str, Path)):
-            raw_df = pd.read_csv(self.data_source)
+            if str(self.data_source).endswith("parquet"):
+                raw_df = pd.read_parquet(self.data_source)
+            else:
+                raw_df = pd.read_csv(self.data_source)
         elif isinstance(self.data_source, pd.DataFrame):
             raw_df = self.data_source.copy()
         else:
@@ -170,10 +172,14 @@ class Taxonomy:
         self.texts_arr = self.df["text"].to_numpy()
         
         self.ce_targets = [
-            #self.cross_encoder_template.format(text=t.lower())
             t.strip()
             for t in self.texts_arr
         ]
+
+        self.nli_hypotheses = {
+            code: self.nli_template.format(text=text.lower().strip())
+            for code, text in zip(self.codes_arr, self.texts_arr)
+        }
 
         self.bm25 = GPUBM25(self.texts_arr.tolist(), device="cuda" if torch.cuda.is_available() else "cpu")
 
@@ -236,11 +242,18 @@ DEFAULT_TAXONOMIES: Dict[str, Dict[str, Any]] = {
         "nli_template": "This statement demonstrates knowledge of or skill in {text}."
     },
     "ai": {
-        "filename": "ai_a6_5_redacted_final2.csv",
+        "filename": "ai.csv",
         "id_column": "Code",
         "text_column": "Statement",
         "cross_encoder_template": "Uses or builds AI systems involving {text}.",
         "nli_template": "This statement indicates the utilization of {text}."
+    },
+    "title": {
+        "filename": "titles.parquet",
+        "id_column": "code",
+        "text_column": "title",
+        "cross_encoder_template": "Represents the role of {text}.",
+        "nli_template": "This text indicates the role of {text}."
     }
 }
 

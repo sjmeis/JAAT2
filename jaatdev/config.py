@@ -1,7 +1,7 @@
 import logging
 import os
 
-logger = logging.getLogger("JAAT")
+logger = logging.getLogger("JAATv2")
 
 if not logger.handlers:
     handler = logging.StreamHandler()
@@ -18,7 +18,7 @@ GLOBAL_SETTINGS = {
 MODEL_CACHE = {}
 
 VERSION = "2.0.0beta"
-COPYRIGHT = "© 2025-2026 Stephen Meisenbacher. All rights reserved."
+COPYRIGHT = "© 2026 Stephen Meisenbacher. All rights reserved."
 DESCRIPTION = "An NLP-powered toolkit for job ad text analysis."
 
 CYAN = "\033[96m"
@@ -27,17 +27,23 @@ RESET = "\033[0m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
 
+# Note: 3D Diagonal
 JAAT_ART = r"""
-      ___           ___           ___           ___     
-     /\  \         /\  \         /\  \         /\  \    
-     \:\  \       /::\  \       /::\  \        \:\  \   
-      \:\  \     /:/\:\  \     /:/\:\  \        \:\  \  
-  ___  \:\  \   /::\~\:\  \   /::\~\:\  \       /::\  \ 
- /\  \  \:\__\ /:/\:\ \:\__\ /:/\:\ \:\__\     /:/\:\__\
- \:\  \ /:/  / \/__\:\/:/  / \/__\:\/:/  /    /:/  \/__/
-  \:\  /:/  /       \::/  /       \::/  /    /:/  /     
-   \:\/:/  /        /:/  /        /:/  /     \/__/      
-    \::/  /        /:/  /        /:/  /                 
-     \/__/         \/__/         \/__/                  
+                                                     ,----,                      
+         ,---._                                    ,/   .`|                      
+       .-- -.' \    ,---,         ,---,          ,`   .'  :             ,----,   
+       |    |   :  '  .' \       '  .' \       ;    ;     /           .'   .' \  
+       :    ;   | /  ;    '.    /  ;    '.   .'___,/    ,'          ,----,'    | 
+       :        |:  :       \  :  :       \  |    :     |     .---. |    :  .  ; 
+       |    :   ::  |   /\   \ :  |   /\   \ ;    |.';  ;   /.  ./| ;    |.'  /  
+       :         |  :  ' ;.   :|  :  ' ;.   :`----'  |  | .-' . ' | `----'/  ;   
+       |    ;   ||  |  ;/  \   \  |  ;/  \   \   '   :  ;/___/ \: |   /  ;  /    
+   ___ l         '  :  | \  \ ,'  :  | \  \ ,'   |   |  '.   \  ' .  ;  /  /-,   
+ /    /\    J   :|  |  '  '--' |  |  '  '--'     '   :  | \   \   ' /  /  /.`|   
+/  ../  `..-    ,|  :  :       |  :  :           ;   |.'   \   \  ./__;      :   
+\    \         ; |  | ,'       |  | ,'           '---'      \   \ |   :    .'    
+ \    \      ,'  `--''         `--''                         '---";   | .'       
+  "---....--'                                                     `---'          
+                                                                                           
 """
 SHOW_ART = os.isatty(1)

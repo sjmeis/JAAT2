@@ -31,13 +31,11 @@ def setup() -> None:
     logger.info("Checking JAAT data files...")
     required_files = [
         "Task_DWA.csv",
-        "lexiconwex2023.csv",
         "skills.csv",
-        "ai_a6_5_redacted_final2.csv",
-        "keywords.json",
+        "ai.csv",
+        "titles.parquet",
         "sub_dict.json",
-        "SOC_map.json",
-        "title_embeddings.pickle"
+        "SOC_map.json"
     ]
     
     missing_files = []

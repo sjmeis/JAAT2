@@ -1,8 +1,11 @@
+import os
+import psutil
 from typing import List, Tuple, Any, Optional
 import torch
-import nltk
 import re
+import importlib.util
 from torch.utils.data import Dataset
+from transformers.utils import is_flash_attn_2_available
 from wtpsplit import SaT
 
 from .config import logger, MODEL_CACHE
@@ -16,9 +19,76 @@ TRAILING_PUNCT = re.compile(r"^[ \t\n\r.\-•*]+|[ \t\n\r.\-•*]+$")
 CLAUSE_DELIMS = re.compile(r"(\s*;\s*|\s*—\s*|\s*--\s*)")
 
 def get_device_settings() -> Tuple[str, int]:
+    """
+    Detects hardware capabilities and derives a sensible batch size.
+    """
+
+    # CUDA
     if torch.cuda.is_available():
-        return "cuda", 1024
-    return "cpu", 64
+        device = "cuda"
+        
+        try:
+            device_props = torch.cuda.get_device_properties(0)
+            total_vram_gb = device_props.total_memory / (1024 ** 3)
+        except Exception:
+            total_vram_gb = 8.0 
+
+        if total_vram_gb >= 40.0:
+            batch_size = 2048
+        elif total_vram_gb >= 20.0:
+            batch_size = 1024
+        elif total_vram_gb >= 14.0:
+            batch_size = 512
+        elif total_vram_gb >= 8.0:
+            batch_size = 256
+        else:
+            batch_size = 64
+
+        return device, batch_size
+
+    # Apple Silicon (MPS)
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        total_ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+        device = "mps"
+        
+        if total_ram_gb >= 32.0:
+            batch_size = 256
+        elif total_ram_gb >= 16.0:
+            batch_size = 128
+        else:
+            batch_size = 64
+            
+        return device, batch_size
+
+    # CPU Fallback
+    device = "cpu"
+    cpu_count = os.cpu_count() or 4
+    total_ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+
+    if cpu_count >= 16 and total_ram_gb >= 32.0:
+        batch_size = 64
+    else:
+        batch_size = 32
+
+    return device, batch_size
+
+def get_optimal_attn_implementation() -> str:
+    """
+    Selects the fastest attention backend available for the current hardware.
+    """
+    if not torch.cuda.is_available():
+        return "sdpa" if hasattr(torch.nn.functional, "scaled_dot_product_attention") else "eager"
+
+    major, _ = torch.cuda.get_device_capability(0)
+    has_compatible_arch = major >= 8
+
+    if has_compatible_arch and is_flash_attn_2_available():
+        return "flash_attention_2"
+
+    if hasattr(torch.nn.functional, "scaled_dot_product_attention"):
+        return "sdpa"
+
+    return "eager"
 
 class ListDataset(Dataset):
     def __init__(self, original_list: List[Any]) -> None:

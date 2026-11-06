@@ -5,7 +5,7 @@ build-backend = 'setuptools.build_meta'
 [project]
 name = "jaatdev"
 version = "2.0.0"
-description = "JAAT dev."
+description = "JAATv2: the new and improved Job Ad Anaylsis Toolkit"
 readme = {file = "README.md", content-type = "text/markdown"}
 authors = [
   {name = "Stephen Meisenbacher", email = "sjmeis@gtgd.com"}
@@ -13,7 +13,6 @@ authors = [
 maintainers = [
   {name = "Stephen Meisenbacher", email = "sjmeis@gtgd.com"}
 ]
-keywords = ["text analysis", "text classification", "semantic matching"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
@@ -24,10 +23,12 @@ dependencies = [
     "importlib_resources",
     "nltk",
     "pandas",
+    "psutil",
     "sentence_transformers>=2.7",
     "torch",
     "tqdm",
     "transformers>=4.40",
+    "accelerate>=0.28.0",
     "wtpsplit",
     "rank-bm25"
 ]

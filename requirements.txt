@@ -2,9 +2,11 @@ requests
 importlib_resources
 nltk
 pandas
+psutil
 sentence_transformers>=2.7
 torch
 tqdm
 transformers>=4.40
+accelerate>=0.28.0
 wtpsplit
 rank-bm25
