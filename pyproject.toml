@@ -38,4 +38,4 @@ packages = ["jaatdev"]
 include-package-data = true
 
 [tool.setuptools.package-data]
-jaatdev = ['JAAT/data/*', 'JAAT/models/*']
+jaatdev = ['jaatdev/data/*']
