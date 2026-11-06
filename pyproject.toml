@@ -3,7 +3,7 @@ requires = ['setuptools>=42']
 build-backend = 'setuptools.build_meta'
 
 [project]
-name = "jaatdev"
+name = "jaat2"
 version = "2.0.0"
 description = "JAATv2: the new and improved Job Ad Anaylsis Toolkit"
 readme = {file = "README.md", content-type = "text/markdown"}
@@ -34,8 +34,8 @@ dependencies = [
 ]
 
 [tool.setuptools]
-packages = ["jaatdev"]
+packages = ["jaat2"]
 include-package-data = true
 
 [tool.setuptools.package-data]
-jaatdev = ['jaatdev/data/*']
+jaatdev = ['jaat2/data/*']

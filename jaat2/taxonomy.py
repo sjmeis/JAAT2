@@ -265,7 +265,7 @@ def load_default_taxonomy(name: str) -> Taxonomy:
         raise ValueError(f"Unknown default taxonomy '{name}'. Available: {list(DEFAULT_TAXONOMIES.keys())}")
     
     cfg = DEFAULT_TAXONOMIES[name]
-    data_path = impresources.files("jaatdev.data") / cfg["filename"]
+    data_path = impresources.files("jaat2.data") / cfg["filename"]
     
     return Taxonomy(
         name=name,

@@ -39,7 +39,7 @@ def setup() -> None:
     ]
     
     missing_files = []
-    data_path = impresources.files("jaatdev.data")
+    data_path = impresources.files("jaat2.data")
     for filename in required_files:
         if not (data_path / filename).is_file():
             missing_files.append(filename)
