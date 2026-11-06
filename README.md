@@ -3,9 +3,14 @@
 
   # Job Ad Analysis Toolkit (JAATv2)
 
-  JAAT is an NLP-powered pipeline for aligning job posting texts (and similar) to standardized taxonomies such as O*NET and ESCO, as well as custom taxonomies describing compentencies. This newest v2 version improves our original [JAAT](https://github.com/Job-Ad-Research-at-QSB-LUC/JAAT) pipeline with some more advanced matching techniques!
+  [![PyPI version](https://img.shields.io/pypi/v/jaat2.svg)](https://pypi.org/project/jaat2/)
+  [![License](https://img.shields.io/github/license/sjmeis/JAAT2.svg)](https://github.com/sjmeis/JAAT2/blob/main/LICENSE)
 
 </div>
+
+JAAT is an NLP-powered pipeline for aligning job posting texts (and similar) to standardized taxonomies such as O*NET and ESCO, as well as custom taxonomies describing compentencies. This newest v2 version improves our original [JAAT](https://github.com/Job-Ad-Research-at-QSB-LUC/JAAT) pipeline with some more advanced matching techniques!
+
+---
 
 ## Installation
 
