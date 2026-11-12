@@ -96,7 +96,7 @@ class Match:
         query_prefix: str = "",
         document_prefix: str = "",
         initial_top_n: int = 25,
-        threshold: float = 0.70,
+        threshold: float = 0.60,
         cross_temp: float = 1.0,
         cross_shift: float = 5.0
     ) -> None:
@@ -340,7 +340,7 @@ class Match:
         scores: List[float],
         min_score_floor: float = 0.35,
         min_drop_ratio: float = 0.08,
-        high_confidence_retention: float = 0.70
+        high_confidence_retention: float = 0.80
     ) -> int:
         """
         Detects the separation boundary between valid multi-matches and noise.
