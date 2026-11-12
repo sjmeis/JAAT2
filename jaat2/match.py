@@ -39,7 +39,7 @@ def get_shared_cross_encoder(model_name: str, device: str, token: Optional[str] 
     key = f"ce_{model_name}"
     torch_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
     if key not in MODEL_CACHE:
-        MODEL_CACHE[key] = CrossEncoder(model_name, device=device, token=token, model_kwargs={"attn_implementation": attn_backend, "dtype": torch_dtype})
+        MODEL_CACHE[key] = CrossEncoder(model_name, device=device, token=token, activation_fn=torch.nn.Sigmoid(), model_kwargs={"attn_implementation": attn_backend, "dtype": torch_dtype})
     return MODEL_CACHE[key]
 
 @torch.inference_mode()
@@ -88,9 +88,9 @@ class Match:
     def __init__(
         self,
         embedding_model: str = "ibm-granite/granite-embedding-english-r2",
-        cross_encoder_model: str = "mixedbread-ai/mxbai-rerank-base-v2",
+        cross_encoder_model: str = "cross-encoder/ettin-reranker-150m-v1",
         classification_model: str = "sjmeis/skill-classifier-small-v3.5",
-        nli_model: Optional[str] = "cross-encoder/nli-deberta-v3-xsmall", #"cross-encoder/nli-deberta-v3-base"
+        nli_model: Optional[str] = "cross-encoder/nli-deberta-v3-xsmall",
         hf_token: Optional[str] = None,
         default_taxonomies: Optional[List[str]] = ("tasks", "skills", "ai", "title"),
         query_prefix: str = "",
@@ -98,6 +98,7 @@ class Match:
         initial_top_n: int = 25,
         threshold: float = 0.70,
         cross_temp: float = 1.0,
+        cross_shift: float = 5.0
     ) -> None:
         logger.info("Initializing Match pipeline...")
         self.device, self.batch_size = get_device_settings()
@@ -109,6 +110,7 @@ class Match:
         self.query_prefix = query_prefix
         self.document_prefix = document_prefix
         self.cross_temp = cross_temp
+        self.cross_shift = cross_shift
         self.hf_token = hf_token
 
         # Bi-encoder and task embeddings
@@ -488,16 +490,19 @@ class Match:
                 show_progress_bar=GLOBAL_SETTINGS.get("show_progress", True)
             )
         raw_arr = np.asarray(raw_ce_preds, dtype=np.float32)
-        if np.all(raw_arr >= 0.0) and np.all(raw_arr <= 1.0):
-            if abs(self.cross_temp - 1.0) > 1e-3:
+
+        is_already_prob = isinstance(getattr(self.cross_encoder, "activation_fn", None), torch.nn.Sigmoid)
+
+        if is_already_prob:
+            if abs(self.cross_temp - 1.0) > 1e-3 or abs(self.cross_shift) > 1e-3:
                 eps = 1e-7
                 clipped = np.clip(raw_arr, eps, 1.0 - eps)
                 logits = np.log(clipped / (1.0 - clipped))
-                scaled_scores = 1.0 / (1.0 + np.exp(-logits / self.cross_temp))
+                scaled_scores = 1.0 / (1.0 + np.exp(-(logits - self.cross_shift) / max(self.cross_temp, 1e-3)))
             else:
                 scaled_scores = raw_arr
         else:
-            scaled_scores = 1.0 / (1.0 + np.exp(-raw_arr / max(self.cross_temp, 0.1)))
+            scaled_scores = 1.0 / (1.0 + np.exp(-(raw_arr - self.cross_shift) / max(self.cross_temp, 1e-3)))
 
         unique_query_cand_scores = np.zeros((U, K), dtype=np.float32)
         for (u_i, rank_pos), score in zip(surviving_coords, scaled_scores):
