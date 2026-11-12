@@ -18,6 +18,8 @@ import torch.nn.functional as F
 import numpy as np
 from dataclasses import dataclass
 import multiprocessing as mp
+import threading
+import queue
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from sentence_transformers import SentenceTransformer, CrossEncoder
 
@@ -179,6 +181,248 @@ class Match:
         self.neutral_idx = id2label.get("neutral", 1)
         self.contra_idx = id2label.get("contradiction", 2 if self.entail_idx != 2 and self.neutral_idx != 2 else 0)
 
+    def _prep_chunk_cpu(self, texts: List[str]) -> List[str]:
+        """Stage 1 (CPU): Clean raw documents ahead of GPU segmentation."""
+        from .base import clean_text
+        return [clean_text(t) for t in texts]
+
+    def _run_gpu_stages(
+        self,
+        cleaned_texts: List[str],
+        taxonomy_name: str,
+        top_k: Optional[int] = None,
+        verify_nli: bool = False,
+        already_cleaned: bool = True
+    ) -> List[Dict[str, Any]]:
+        """Stage 2 (GPU): Segmentation, candidate classification, hybrid RRF, reranking, and NLI."""
+        tax = self._taxonomies[taxonomy_name]
+
+        logger.info("Extracting candidates...")
+        all_data = self.get_candidates_batch(cleaned_texts, already_cleaned=already_cleaned)
+        if not all_data:
+            return []
+
+        raw_query_texts = [d[1] for d in all_data]
+        unique_queries, inverse_map = np.unique(raw_query_texts, return_inverse=True)
+        U = len(unique_queries)
+
+        use_cuda = "cuda" in str(self.device)
+        autocast_dtype = torch.bfloat16 if (use_cuda and torch.cuda.is_bf16_supported()) else torch.float16
+
+        # Embedding coarse search
+        logger.info("Running coarse retrieval...")
+        prefixed_unique = [f"{self.query_prefix}{q}" for q in unique_queries]
+
+        with torch.inference_mode():
+            q_embed = self.embedding_model.encode(
+                prefixed_unique,
+                convert_to_tensor=True,
+                batch_size=512,
+                show_progress_bar=GLOBAL_SETTINGS.get("show_progress", False)
+            ).to(self.device, dtype=autocast_dtype)
+            q_embed = F.normalize(q_embed, p=2, dim=1)
+
+            k_pool = min(self.initial_top_n * 2, tax.embeddings.shape[0])
+            with torch.autocast(device_type="cuda" if use_cuda else "cpu", dtype=autocast_dtype, enabled=use_cuda):
+                sim_matrix = torch.mm(q_embed, tax.embeddings_T)
+                dense_top_scores, dense_top_indices_gpu = torch.topk(sim_matrix, k=k_pool, dim=1)
+            del q_embed, sim_matrix
+
+            confident_mask = (dense_top_scores[:, 0] >= 0.85)
+            uncertain_indices = torch.where(~confident_mask)[0].cpu().tolist()
+            fused_cand_gpu = dense_top_indices_gpu[:, :self.initial_top_n].clone()
+
+            if uncertain_indices:
+                uncertain_texts = [unique_queries[i] for i in uncertain_indices]
+                bm25_top_indices_gpu = tax.bm25.query_topk(uncertain_texts, k=k_pool)
+
+                sub_dense = dense_top_indices_gpu[uncertain_indices]
+                sub_M = len(uncertain_indices)
+
+                combined_cands = torch.cat([sub_dense, bm25_top_indices_gpu], dim=1)
+                ranks = torch.arange(1, k_pool + 1, device=self.device, dtype=torch.float32)
+                rrf_weights = 1.0 / (60.0 + ranks)
+                combined_weights = torch.cat([rrf_weights, rrf_weights]).unsqueeze(0).expand(sub_M, -1)
+
+                fused_scores = torch.zeros((sub_M, len(tax.codes_arr)), device=self.device, dtype=torch.float32)
+                fused_scores.scatter_add_(1, combined_cands, combined_weights)
+                _, sub_fused = torch.topk(fused_scores, k=self.initial_top_n, dim=1)
+
+                fused_cand_gpu[uncertain_indices] = sub_fused
+                del fused_scores, bm25_top_indices_gpu, combined_cands, combined_weights
+
+            dense_top_scores_cpu = dense_top_scores[:, :self.initial_top_n].to(torch.float32).cpu().numpy()
+            dense_top_indices_cpu = dense_top_indices_gpu[:, :self.initial_top_n].cpu().numpy()
+            del dense_top_scores, dense_top_indices_gpu
+
+        fused_cand_unique = fused_cand_gpu.cpu().numpy()
+        del fused_cand_gpu
+
+        # Prune low-confidence dense matches to save CE runtime, keep MIN (10)
+        K = self.initial_top_n
+        MIN_KEEP_TOP_N = min(10, K)
+        DENSE_SCORE_FLOOR = 0.40
+
+        ce_pairs: List[Tuple[str, str]] = []
+        surviving_coords: List[Tuple[int, int]] = []
+
+        for u_i in range(U):
+            q_text = unique_queries[u_i]
+            conditioned_q = condition_query(q_text)
+            for rank_pos in range(K):
+                c_idx = fused_cand_unique[u_i, rank_pos]
+                dense_matches = np.where(dense_top_indices_cpu[u_i] == c_idx)[0]
+                bi_score = (
+                    float(dense_top_scores_cpu[u_i, dense_matches[0]])
+                    if len(dense_matches) > 0
+                    else 0.0
+                )
+
+                if rank_pos < MIN_KEEP_TOP_N or bi_score >= DENSE_SCORE_FLOOR:
+                    ce_pairs.append((conditioned_q, tax.ce_targets[c_idx]))
+                    surviving_coords.append((u_i, rank_pos))
+
+        # Cross-Encoder Rerank
+        logger.info("Re-ranking...")
+        raw_ce_preds = cross_encoder_predict(
+            self.cross_encoder,
+            ce_pairs,
+            batch_size=512,
+            show_progress_bar=GLOBAL_SETTINGS.get("show_progress", True)
+        )
+        raw_arr = np.asarray(raw_ce_preds, dtype=np.float32)
+
+        is_already_prob = isinstance(getattr(self.cross_encoder, "activation_fn", None), torch.nn.Sigmoid)
+
+        if is_already_prob:
+            if abs(self.cross_temp - 1.0) > 1e-3 or abs(self.cross_shift) > 1e-3:
+                eps = 1e-7
+                clipped = np.clip(raw_arr, eps, 1.0 - eps)
+                logits = np.log(clipped / (1.0 - clipped))
+                scaled_scores = 1.0 / (1.0 + np.exp(-(logits - self.cross_shift) / max(self.cross_temp, 1e-3)))
+            else:
+                scaled_scores = raw_arr
+        else:
+            scaled_scores = 1.0 / (1.0 + np.exp(-(raw_arr - self.cross_shift) / max(self.cross_temp, 1e-3)))
+
+        unique_query_cand_scores = np.zeros((U, K), dtype=np.float32)
+        for (u_i, rank_pos), score in zip(surviving_coords, scaled_scores):
+            unique_query_cand_scores[u_i, rank_pos] = score
+
+        # Apply Cutoff
+        M = len(all_data)
+        doc_indices = [d[0] for d in all_data]
+
+        selected_records = []
+        for i in range(M):
+            u_idx = inverse_map[i]
+            scores_row = unique_query_cand_scores[u_idx]
+            cands_row = fused_cand_unique[u_idx]
+
+            sort_order = np.argsort(-scores_row)
+            sorted_scores = scores_row[sort_order]
+            sorted_cands = cands_row[sort_order]
+
+            cutoff = min(top_k, K) if top_k is not None else self._find_adaptive_elbow(sorted_scores.tolist())
+
+            for rank_idx in range(cutoff):
+                sc = sorted_scores[rank_idx]
+                if sc < self.threshold:
+                    break
+
+                c_idx = sorted_cands[rank_idx]
+                selected_records.append({
+                    "orig_doc_idx": doc_indices[i],
+                    "query_sent": raw_query_texts[i],
+                    "tax_idx": c_idx,
+                    "code": tax.codes_arr[c_idx],
+                    "text": tax.texts_arr[c_idx],
+                    "score": float(sc),
+                    "nli_data": None
+                })
+
+        # Optional NLI Verification
+        if verify_nli and self.nli_model and selected_records:
+            nli_scores = self._score_nli_entailment(
+                selected_records,
+                tax=tax,
+                batch_size=1024,
+                min_entail_prob=0.40,
+                max_contradiction_prob=0.20
+            )
+            for r, n_data in zip(selected_records, nli_scores):
+                r["nli_data"] = n_data
+
+        return selected_records
+
+    def _postprocess_chunk_cpu(
+        self,
+        num_docs: int,
+        selected_records: List[Dict[str, Any]],
+        tax_name: str,
+        verify_nli: bool,
+        return_original: bool
+    ) -> List[List[Dict[str, Any]]]:
+        """Stage 3 (CPU): Aggregate, deduplicate, and sort evidence per document."""
+        aggregated_by_doc: List[Dict[str, Dict[str, Any]]] = [{} for _ in range(num_docs)]
+
+        for r in selected_records:
+            if r["score"] < self.threshold:
+                continue
+
+            if verify_nli and r["nli_data"] is not None:
+                if not r["nli_data"]["verified"]:
+                    continue
+
+            d_idx = r["orig_doc_idx"]
+            c_id = r["code"]
+            curr_score = round(r["score"], 4)
+            v_score = (
+                round(r["nli_data"]["entailment_prob"], 4)
+                if (verify_nli and r["nli_data"] is not None)
+                else None
+            )
+
+            evidence_item: Dict[str, Any] = {"score": curr_score}
+            if return_original:
+                evidence_item["sentence"] = r["query_sent"]
+            if verify_nli:
+                evidence_item["verification_score"] = v_score
+
+            doc_store = aggregated_by_doc[d_idx]
+            if c_id not in doc_store:
+                doc_store[c_id] = {
+                    "code": c_id,
+                    "matched_text": r["text"],
+                    "taxonomy": tax_name,
+                    "score": curr_score,
+                    "frequency": 1,
+                    "evidence": [evidence_item],
+                }
+                if return_original:
+                    doc_store[c_id]["query_sentence"] = r["query_sent"]
+                if verify_nli:
+                    doc_store[c_id]["verification_score"] = v_score
+            else:
+                doc_store[c_id]["frequency"] += 1
+                doc_store[c_id]["evidence"].append(evidence_item)
+                if curr_score > doc_store[c_id]["score"]:
+                    doc_store[c_id]["score"] = curr_score
+                    if return_original:
+                        doc_store[c_id]["query_sentence"] = r["query_sent"]
+                    if verify_nli:
+                        doc_store[c_id]["verification_score"] = v_score
+
+        final_results: List[List[Dict[str, Any]]] = []
+        for doc_store in aggregated_by_doc:
+            doc_items = list(doc_store.values())
+            for item in doc_items:
+                item["evidence"].sort(key=lambda x: x["score"], reverse=True)
+            doc_items.sort(key=lambda x: x["score"], reverse=True)
+            final_results.append(doc_items)
+
+        return final_results
+
     def register_taxonomy(self, taxonomy: Taxonomy) -> None:
         """Indexes and stores a taxonomy."""
         logger.info(f"Registering taxonomy '{taxonomy.name}' ({len(taxonomy.df)} items)...")
@@ -190,9 +434,9 @@ class Match:
         )
         self._taxonomies[taxonomy.name] = taxonomy
 
-    def get_candidates_batch(self, texts: List[str]) -> List[Tuple[int, str]]:
+    def get_candidates_batch(self, texts: List[str], already_cleaned: bool = False) -> List[Tuple[int, str]]:
         splitter = get_sentence_splitter(device=self.device)
-        docs_segmented = splitter.split_two_pass(texts)
+        docs_segmented = splitter.split_two_pass(texts, already_cleaned=already_cleaned)
 
         all_data: List[Tuple[int, str]] = []
         for doc_idx, sentences in enumerate(docs_segmented):
@@ -226,7 +470,12 @@ class Match:
                     truncation=True,
                     max_length=64,
                     return_tensors="pt"
-                ).to(self.device)
+                )
+
+                if use_cuda:
+                    inputs = {k: v.pin_memory().to(self.device, non_blocking=True) for k, v in inputs.items()}
+                else:
+                    inputs = inputs.to(self.device)
 
                 with torch.autocast(device_type="cuda" if use_cuda else "cpu", dtype=autocast_dtype):
                     logits = self.clf_model(**inputs).logits
@@ -302,7 +551,12 @@ class Match:
                 truncation=True,
                 max_length=128,
                 return_tensors="pt"
-            ).to(self.device)
+            )
+
+            if use_cuda:
+                encoded = {k: v.pin_memory().to(self.device, non_blocking=True) for k, v in encoded.items()}
+            else:
+                encoded = encoded.to(self.device)
 
             with torch.inference_mode():
                 with torch.autocast(device_type="cuda" if use_cuda else "cpu", dtype=autocast_dtype, enabled=use_cuda):
@@ -391,235 +645,25 @@ class Match:
         if taxonomy_name not in self._taxonomies:
             raise KeyError(f"Taxonomy '{taxonomy_name}' is not registered. Registered: {list(self._taxonomies.keys())}")
 
-        tax = self._taxonomies[taxonomy_name]
+        if not texts:
+            return []
 
-        logger.info("Extracting candidates...")
-        all_data = self.get_candidates_batch(texts)
-        results: List[List[Dict[str, Any]]] = [[] for _ in range(len(texts))]
-        if not all_data:
-            return results
-
-        raw_query_texts = [d[1] for d in all_data]
-        unique_queries, inverse_map = np.unique(raw_query_texts, return_inverse=True)
-        U = len(unique_queries)
-
-        use_cuda = "cuda" in str(self.device)
-        autocast_dtype = torch.bfloat16 if (use_cuda and torch.cuda.is_bf16_supported()) else torch.float16
-
-        # Embedding coarse search
-        logger.info("Running coarse retrieval...")
-        prefixed_unique = [f"{self.query_prefix}{q}" for q in unique_queries]
-
-        with torch.inference_mode():
-            q_embed = self.embedding_model.encode(
-                prefixed_unique,
-                convert_to_tensor=True,
-                batch_size=512,
-                show_progress_bar=GLOBAL_SETTINGS.get("show_progress", False)
-            ).to(self.device, dtype=autocast_dtype)
-            q_embed = F.normalize(q_embed, p=2, dim=1)
-
-            k_pool = min(self.initial_top_n * 2, tax.embeddings.shape[0])
-            with torch.autocast(device_type="cuda" if use_cuda else "cpu", dtype=autocast_dtype, enabled=use_cuda):
-                sim_matrix = torch.mm(q_embed, tax.embeddings_T)
-                dense_top_scores, dense_top_indices_gpu = torch.topk(sim_matrix, k=k_pool, dim=1)
-            del q_embed, sim_matrix
-
-            confident_mask = (dense_top_scores[:, 0] >= 0.85)
-            uncertain_indices = torch.where(~confident_mask)[0].cpu().tolist()
-            fused_cand_gpu = dense_top_indices_gpu[:, :self.initial_top_n].clone()
-
-            if uncertain_indices:
-                uncertain_texts = [unique_queries[i] for i in uncertain_indices]
-                bm25_top_indices_gpu = tax.bm25.query_topk(uncertain_texts, k=k_pool)
-
-                sub_dense = dense_top_indices_gpu[uncertain_indices]
-                sub_M = len(uncertain_indices)
-
-                combined_cands = torch.cat([sub_dense, bm25_top_indices_gpu], dim=1)
-                
-                ranks = torch.arange(1, k_pool + 1, device=self.device, dtype=torch.float32)
-                rrf_weights = 1.0 / (60.0 + ranks)
-                combined_weights = torch.cat([rrf_weights, rrf_weights]).unsqueeze(0).expand(sub_M, -1)
-
-                fused_scores = torch.zeros((sub_M, len(tax.codes_arr)), device=self.device, dtype=torch.float32)
-                fused_scores.scatter_add_(1, combined_cands, combined_weights)
-                _, sub_fused = torch.topk(fused_scores, k=self.initial_top_n, dim=1)
-
-                fused_cand_gpu[uncertain_indices] = sub_fused
-                del fused_scores, bm25_top_indices_gpu, combined_cands, combined_weights
-
-            dense_top_scores_cpu = dense_top_scores[:, :self.initial_top_n].to(torch.float32).cpu().numpy()
-            dense_top_indices_cpu = dense_top_indices_gpu[:, :self.initial_top_n].cpu().numpy()
-            del dense_top_scores, dense_top_indices_gpu
-
-        fused_cand_unique = fused_cand_gpu.cpu().numpy()
-        del fused_cand_gpu
-
-        # prune low-confidence dense matches to save CE runtime, keep MIN (10)
-        K = self.initial_top_n
-        MIN_KEEP_TOP_N = min(10, K)
-        DENSE_SCORE_FLOOR = 0.40
-
-        ce_pairs: List[Tuple[str, str]] = []
-        surviving_coords: List[Tuple[int, int]] = []
-
-        for u_i in range(U):
-            q_text = unique_queries[u_i]
-            conditioned_q = condition_query(q_text)
-            
-            for rank_pos in range(K):
-                c_idx = fused_cand_unique[u_i, rank_pos]
-                dense_matches = np.where(dense_top_indices_cpu[u_i] == c_idx)[0]
-                bi_score = (
-                    float(dense_top_scores_cpu[u_i, dense_matches[0]])
-                    if len(dense_matches) > 0
-                    else 0.0
-                )
-
-                if rank_pos < MIN_KEEP_TOP_N or bi_score >= DENSE_SCORE_FLOOR:
-                    ce_pairs.append((conditioned_q, tax.ce_targets[c_idx]))
-                    surviving_coords.append((u_i, rank_pos))
-
-        # Cross-Encoder Rerank
-        logger.info("Re-ranking...")
-        raw_ce_preds = cross_encoder_predict(
-                self.cross_encoder,
-                ce_pairs,
-                batch_size=512,
-                show_progress_bar=GLOBAL_SETTINGS.get("show_progress", True)
-            )
-        raw_arr = np.asarray(raw_ce_preds, dtype=np.float32)
-
-        is_already_prob = isinstance(getattr(self.cross_encoder, "activation_fn", None), torch.nn.Sigmoid)
-
-        if is_already_prob:
-            if abs(self.cross_temp - 1.0) > 1e-3 or abs(self.cross_shift) > 1e-3:
-                eps = 1e-7
-                clipped = np.clip(raw_arr, eps, 1.0 - eps)
-                logits = np.log(clipped / (1.0 - clipped))
-                scaled_scores = 1.0 / (1.0 + np.exp(-(logits - self.cross_shift) / max(self.cross_temp, 1e-3)))
-            else:
-                scaled_scores = raw_arr
-        else:
-            scaled_scores = 1.0 / (1.0 + np.exp(-(raw_arr - self.cross_shift) / max(self.cross_temp, 1e-3)))
-
-        unique_query_cand_scores = np.zeros((U, K), dtype=np.float32)
-        for (u_i, rank_pos), score in zip(surviving_coords, scaled_scores):
-            unique_query_cand_scores[u_i, rank_pos] = score
-
-        # Apply Cutoff
-        M = len(all_data)
-        doc_indices = [d[0] for d in all_data]
-
-        selected_records = []
-        for i in range(M):
-            u_idx = inverse_map[i]
-            scores_row = unique_query_cand_scores[u_idx]
-            cands_row = fused_cand_unique[u_idx]
-
-            sort_order = np.argsort(-scores_row)
-            sorted_scores = scores_row[sort_order]
-            sorted_cands = cands_row[sort_order]
-
-            cutoff = min(top_k, K) if top_k is not None else self._find_adaptive_elbow(sorted_scores.tolist())
-
-            for rank_idx in range(cutoff):
-                sc = sorted_scores[rank_idx]
-                if sc < self.threshold:
-                    break
-                
-                c_idx = sorted_cands[rank_idx]
-                selected_records.append({
-                    "orig_doc_idx": doc_indices[i],
-                    "query_sent": raw_query_texts[i],
-                    "tax_idx": c_idx,
-                    "code": tax.codes_arr[c_idx],
-                    "text": tax.texts_arr[c_idx],
-                    "score": float(sc)
-                })
-
-        # Optional NLI Verification
-        if verify_nli and self.nli_model and selected_records:
-            nli_scores = self._score_nli_entailment(
-                selected_records,
-                tax=tax,
-                batch_size=1024,
-                min_entail_prob=0.40,
-                max_contradiction_prob=0.20
-            )
-            for r, n_data in zip(selected_records, nli_scores):
-                r["nli_data"] = n_data
-        else:
-            for r in selected_records:
-                r["nli_data"] = None
-
-        # Filter by minimum confidence and structure output
+        cleaned_texts = self._prep_chunk_cpu(texts)
+        selected_records = self._run_gpu_stages(
+            cleaned_texts=cleaned_texts,
+            taxonomy_name=taxonomy_name,
+            top_k=top_k,
+            verify_nli=verify_nli,
+            already_cleaned=True
+        )
         logger.info("Aggregating results...")
-        aggregated_by_doc: List[Dict[str, Dict[str, Any]]] = [{} for _ in range(len(texts))]
-        for r in selected_records:
-            if r["score"] < self.threshold:
-                continue
-
-            if verify_nli and r["nli_data"] is not None:
-                n_data = r["nli_data"]               
-                if not n_data["verified"]:
-                    continue
-
-            d_idx = r["orig_doc_idx"]
-            c_id = r["code"]
-            curr_score = round(r["score"], 4)
-            v_score = (
-                round(r["nli_data"]["entailment_prob"], 4)
-                if (verify_nli and r["nli_data"] is not None)
-                else None
-            )
-
-            evidence_item = {
-                "sentence": r["query_sent"],
-                "score": curr_score,
-            }
-            if verify_nli:
-                evidence_item["verification_score"] = v_score
-
-            doc_store = aggregated_by_doc[d_idx]
-
-            if c_id not in doc_store:
-                doc_store[c_id] = {
-                    "code": c_id,
-                    "matched_text": r["text"],
-                    "taxonomy": tax.name,
-                    "score": curr_score,
-                    "frequency": 1,
-                    "evidence": [evidence_item],
-                }
-                if return_original:
-                    doc_store[c_id]["query_sentence"] = r["query_sent"]
-                if verify_nli:
-                    doc_store[c_id]["verification_score"] = v_score
-            else:
-                doc_store[c_id]["frequency"] += 1
-                doc_store[c_id]["evidence"].append(evidence_item)
-
-                if curr_score > doc_store[c_id]["score"]:
-                    doc_store[c_id]["score"] = curr_score
-                    if return_original:
-                        doc_store[c_id]["query_sentence"] = r["query_sent"]
-                    if verify_nli:
-                        doc_store[c_id]["verification_score"] = v_score
-
-        # Sort descending within each match
-        final_results: List[List[Dict[str, Any]]] = []
-        for doc_store in aggregated_by_doc:
-            doc_items = list(doc_store.values())
-
-            for item in doc_items:
-                item["evidence"].sort(key=lambda x: x["score"], reverse=True)
-
-            doc_items.sort(key=lambda x: x["score"], reverse=True)
-            final_results.append(doc_items)
-
-        return final_results
+        return self._postprocess_chunk_cpu(
+            num_docs=len(texts),
+            selected_records=selected_records,
+            tax_name=taxonomy_name,
+            verify_nli=verify_nli,
+            return_original=return_original
+        )
 
     def match_dataset(
         self,
@@ -631,29 +675,86 @@ class Match:
         return_original: bool = False
     ) -> Generator[List[Dict[str, Any]], None, None]:
         """
-        Streaming runner for many documents.
-        Processes documents in chunks, yielding results doc by doc.
+        Asynchronous multi-stage streaming runner.
+        Overlaps CPU preprocessing and postprocessing with GPU inference.
         """
+        if taxonomy_name not in self._taxonomies:
+            raise KeyError(f"Taxonomy '{taxonomy_name}' is not registered.")
+
         total_docs = len(texts)
-        logger.info(f"Processing {total_docs} documents in batches of {doc_chunk_size}...")
+        if total_docs == 0:
+            return
 
-        for start_idx in range(0, total_docs, doc_chunk_size):
-            end_idx = min(start_idx + doc_chunk_size, total_docs)
-            chunk_texts = texts[start_idx:end_idx]
+        prep_queue: queue.Queue = queue.Queue(maxsize=2)
+        post_queue: queue.Queue = queue.Queue(maxsize=2)
+        stop_event = threading.Event()
+        errors: List[BaseException] = []
 
-            logger.info(f"Processing chunk {start_idx} to {end_idx}...")
-            chunk_results = self.match_batch(
-                texts=chunk_texts,
-                taxonomy_name=taxonomy_name,
-                top_k=top_k,
-                verify_nli=verify_nli,
-                return_original=return_original
-            )
+        _SENTINEL = object()
 
-            for doc_result in chunk_results:
-                yield doc_result
+        # Worker 1 (CPU): Cleans and prepares upcoming document chunks
+        def cpu_producer():
+            try:
+                for start_idx in range(0, total_docs, doc_chunk_size):
+                    if stop_event.is_set():
+                        break
+                    chunk_texts = texts[start_idx : start_idx + doc_chunk_size]
+                    cleaned_chunk = self._prep_chunk_cpu(chunk_texts)
+                    prep_queue.put((len(chunk_texts), cleaned_chunk))
+            except BaseException as e:
+                errors.append(e)
+                stop_event.set()
+            finally:
+                prep_queue.put(_SENTINEL)
 
-            del chunk_results
+        # Worker 2 (GPU)
+        def gpu_worker():
+            try:
+                while not stop_event.is_set():
+                    item = prep_queue.get()
+                    if item is _SENTINEL:
+                        break
+                    num_docs, cleaned_chunk = item
+                    selected_records = self._run_gpu_stages(
+                        cleaned_texts=cleaned_chunk,
+                        taxonomy_name=taxonomy_name,
+                        top_k=top_k,
+                        verify_nli=verify_nli
+                    )
+                    post_queue.put((num_docs, selected_records))
+            except BaseException as e:
+                errors.append(e)
+                stop_event.set()
+            finally:
+                post_queue.put(_SENTINEL)
+
+        t_prep = threading.Thread(target=cpu_producer, name="jaat-cpu-prep", daemon=True)
+        t_gpu = threading.Thread(target=gpu_worker, name="jaat-gpu-infer", daemon=True)
+        t_prep.start()
+        t_gpu.start()
+
+        try:
+            # Main Thread (CPU): Aggregates results
+            while True:
+                item = post_queue.get()
+                if item is _SENTINEL:
+                    break
+                num_docs, selected_records = item
+                chunk_results = self._postprocess_chunk_cpu(
+                    num_docs=num_docs,
+                    selected_records=selected_records,
+                    tax_name=taxonomy_name,
+                    verify_nli=verify_nli,
+                    return_original=return_original
+                )
+                for doc_result in chunk_results:
+                    yield doc_result
+        finally:
+            stop_event.set()
+            t_prep.join(timeout=2.0)
+            t_gpu.join(timeout=2.0)
+            if errors:
+                raise errors[0]
 
     def match(
         self,

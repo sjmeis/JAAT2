@@ -117,7 +117,6 @@ def clean_text(text: str) -> str:
     """Pre-normalizes delimiters, bullets, and line breaks into standard clause boundaries."""
     if not text:
         return ""
-    lines = [line.strip() for line in text.split("\n") if line.strip()]
     normalized_lines = [
         line if line.endswith((".", "!", "?")) else f"{line}."
         for line in (l.strip() for l in text.splitlines())
@@ -166,12 +165,13 @@ class BatchedSaTSplitter:
         pass2_threshold: float = 0.20,
         min_words: int = 2,
         max_words: int = 48,
-        pass2_char_length: int = 80
+        pass2_char_length: int = 80,
+        already_cleaned: bool = False
     ) -> List[List[str]]:
         if not docs:
             return []
 
-        cleaned_docs = [clean_text(d) for d in docs]
+        cleaned_docs = docs if already_cleaned else [clean_text(d) for d in docs]
 
         doc_sentences_raw = self.sat.split(
             cleaned_docs,
