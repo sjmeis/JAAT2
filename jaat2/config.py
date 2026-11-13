@@ -17,7 +17,7 @@ GLOBAL_SETTINGS = {
 
 MODEL_CACHE = {}
 
-VERSION = "2.0.2beta"
+VERSION = "2.0.3beta"
 COPYRIGHT = "© 2026 Stephen Meisenbacher. All rights reserved."
 DESCRIPTION = "An NLP-powered toolkit for job ad text analysis."
 

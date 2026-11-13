@@ -2,6 +2,8 @@ requests
 importlib_resources
 nltk
 pandas
+pyarrow
+fastparquet
 psutil
 sentence_transformers>=2.7
 torch
