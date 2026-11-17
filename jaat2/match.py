@@ -163,9 +163,9 @@ class Match:
         self.rewrite_min_sim = rewrite_min_sim
         self.rewriter: Optional[BatchedClauseRewriter] = None
 
-        if self.canonicalize and self.canonicalizer_model_name:
-            self.canonicalizer = BatchedClauseRewriter(
-                self.canonicalizer_model_name,
+        if self.rewrite and self.rewriter_model_name:
+            self.rewriter = BatchedClauseRewriter(
+                self.rewriter_model_name,
                 device=self.device,
                 hf_token=self.hf_token
             )
@@ -511,8 +511,8 @@ class Match:
                 filtered.append((doc_idx, sent))
 
         # Post-filter rewriter
-        use_canon = self.canonicalize if rewrite is None else rewrite
-        if not filtered or not use_canon:
+        use_rewrite = self.rewrite if rewrite is None else rewrite
+        if not filtered or not use_rewrite:
             return filtered
 
         if self.rewriter is None and getattr(self, "rewriter_model_name", None):
@@ -525,9 +525,9 @@ class Match:
             return filtered
 
         unique_filtered = list(dict.fromkeys(sent for _, sent in filtered))
-        rewritten_list = self.canonicalizer.canonicalize_batch(
+        rewritten_list = self.rewriter.rewrite_batch(
             unique_filtered,
-            batch_size=max(64, self.batch_size // 4),
+            batch_size=max(64, self.batch_size // 4)
         )
         raw_to_rew = dict(zip(unique_filtered, rewritten_list))
 

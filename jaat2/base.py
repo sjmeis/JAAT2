@@ -269,7 +269,7 @@ class BatchedClauseRewriter:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model_name = model_name
 
-        cache_key = f"canon_{model_name}"
+        cache_key = f"rewrite_{model_name}"
         if cache_key not in MODEL_CACHE:
             logger.info(f"Loading rewriter '{model_name}' on {self.device}...")
             use_bf16 = "cuda" in str(self.device) and torch.cuda.is_bf16_supported()
@@ -285,7 +285,7 @@ class BatchedClauseRewriter:
         self.tokenizer, self.model = MODEL_CACHE[cache_key]
 
     @torch.inference_mode()
-    def canonicalize_batch(
+    def rewrite_batch(
         self,
         sentences: List[str],
         batch_size: int = 128,
