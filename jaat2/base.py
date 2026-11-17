@@ -15,13 +15,16 @@
 import os
 import psutil
 from typing import List, Tuple, Any, Optional
+import numpy as np
 import torch
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 import re
 from torch.utils.data import Dataset
 from transformers.utils import is_flash_attn_2_available
 from wtpsplit import SaT
 
 from .config import logger, MODEL_CACHE
+from .utils import progress_bar
 
 BULLET_PATTERN = re.compile(r"(^|\n)[\s•·\-\*]+\s*")
 DELIM_PATTERN = re.compile(r"[;]\s*")
@@ -30,6 +33,8 @@ MULTI_PUNCT = re.compile(r"\.{2,}")
 MULTI_SPACE = re.compile(r"[ \t]+")
 TRAILING_PUNCT = re.compile(r"^[ \t\n\r.\-•*]+|[ \t\n\r.\-•*]+$")
 CLAUSE_DELIMS = re.compile(r"(\s*;\s*|\s*—\s*|\s*--\s*)")
+
+REWRITER_PREFIX = "canonicalize job statement: "
 
 def get_device_settings() -> Tuple[str, int]:
     """
@@ -248,3 +253,86 @@ def sent_tokenize(text: str) -> List[str]:
     splitter = get_sentence_splitter()
     results = splitter.split_two_pass([text])
     return results[0] if results else []
+
+class BatchedClauseRewriter:
+    """
+    Batched Seq2Seq clause rewriter (currently: fine-tuned Flan-T5-base) that normalizes
+    raw job posting clauses into clean, imperative statements.
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        device: Optional[str] = None,
+        hf_token: Optional[str] = None,
+    ) -> None:
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.model_name = model_name
+
+        cache_key = f"canon_{model_name}"
+        if cache_key not in MODEL_CACHE:
+            logger.info(f"Loading rewriter '{model_name}' on {self.device}...")
+            use_bf16 = "cuda" in str(self.device) and torch.cuda.is_bf16_supported()
+            tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token)
+            model = AutoModelForSeq2SeqLM.from_pretrained(
+                model_name,
+                token=hf_token,
+                dtype=torch.bfloat16 if use_bf16 else torch.float32,
+            ).to(self.device)
+            model.eval()
+            MODEL_CACHE[cache_key] = (tokenizer, model)
+
+        self.tokenizer, self.model = MODEL_CACHE[cache_key]
+
+    @torch.inference_mode()
+    def canonicalize_batch(
+        self,
+        sentences: List[str],
+        batch_size: int = 128,
+        max_source_len: int = 96,
+        max_new_tokens: int = 48,
+        num_beams: int = 1,
+    ) -> List[str]:
+        """
+        Rewrites a list of extracted clauses in length-sorted batches.
+        Returns a list aligned 1-to-1 with `sentences`.
+        """
+        if not sentences:
+            return []
+
+        n = len(sentences)
+        results = [""] * n
+
+        sort_order = np.argsort([len(s) for s in sentences])
+
+        total_batches = (n + batch_size - 1) // batch_size
+        pbar = progress_bar(
+            range(0, n, batch_size),
+            total=total_batches,
+            desc="Rewriting statements",
+        )
+
+        for b_start in pbar:
+            batch_indices = sort_order[b_start : b_start + batch_size]
+            prefixed = [f"{REWRITER_PREFIX}{sentences[idx].strip()}" for idx in batch_indices]
+
+            inputs = self.tokenizer(
+                prefixed,
+                padding=True,
+                truncation=True,
+                max_length=max_source_len,
+                return_tensors="pt",
+            ).to(self.device)
+
+            gen_ids = self.model.generate(
+                **inputs,
+                num_beams=num_beams,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+            )
+            decoded = self.tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+
+            for orig_idx, text in zip(batch_indices, decoded):
+                results[orig_idx] = text.strip()
+
+        return results

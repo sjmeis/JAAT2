@@ -64,8 +64,8 @@ Input Text
 [1] Two-Pass Segmentation (SaT / wtpsplit)
    │  └── Deconstructs text into clauses
    ▼
-[2] Clause Classification
-   │  └── Discards non-target candidates
+[2] Clause Classification + Optional Rewriting
+   │  └── Discards non-target candidates and optionally rewrites positive candidates into canonical form
    ▼
 [3] Hybrid Retrieval (BM25 + Embeddings)
    │  └── Reciprocal Rank Fusion (RRF) over Top-K candidate pool
@@ -115,3 +115,6 @@ custom_tax = Taxonomy(
 
 matcher.register_taxonomy(custom_tax)
 ```
+
+## License
+`jaat2` is licensed under an Apache-2.0 license. NOTE: as this new and improved version is still in beta, some of the default underlying models are still private on Hugging Face. If you want to test out the beta, let us know and we can provide an access key! Thanks for stopping by.

@@ -23,7 +23,7 @@ import queue
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from sentence_transformers import SentenceTransformer, CrossEncoder
 
-from .base import get_device_settings, get_sentence_splitter, get_optimal_attn_implementation
+from .base import get_device_settings, get_sentence_splitter, get_optimal_attn_implementation, BatchedClauseRewriter, filter_valid_sentence
 from .config import MODEL_CACHE, logger, GLOBAL_SETTINGS
 from .utils import progress_bar
 from .taxonomy import Taxonomy, load_default_taxonomy
@@ -93,6 +93,7 @@ class Match:
         cross_encoder_model: str = "cross-encoder/ettin-reranker-150m-v1",
         classification_model: str = "sjmeis/skill-classifier-small-v3.5",
         nli_model: Optional[str] = "cross-encoder/nli-deberta-v3-xsmall",
+        rewriter_model: str = "sjmeis/skill-rewriter-v1",
         hf_token: Optional[str] = None,
         default_taxonomies: Optional[List[str]] = ("tasks", "skills", "ai", "title"),
         query_prefix: str = "",
@@ -100,7 +101,9 @@ class Match:
         initial_top_n: int = 25,
         threshold: float = 0.60,
         cross_temp: float = 1.0,
-        cross_shift: float = 5.0
+        cross_shift: float = 5.0,
+        rewrite: bool = True,
+        rewrite_min_sim: float = 0.75
     ) -> None:
         logger.info("Initializing Match pipeline...")
         self.device, self.batch_size = get_device_settings()
@@ -153,6 +156,19 @@ class Match:
         if nli_model:
             logger.info(f"Setting up NLI verification engine: {nli_model}...")
             self._init_nli(nli_model)
+
+        # Rewriting Model
+        self.rewrite = rewrite
+        self.rewriter_model_name = rewriter_model
+        self.rewrite_min_sim = rewrite_min_sim
+        self.rewriter: Optional[BatchedClauseRewriter] = None
+
+        if self.canonicalize and self.canonicalizer_model_name:
+            self.canonicalizer = BatchedClauseRewriter(
+                self.canonicalizer_model_name,
+                device=self.device,
+                hf_token=self.hf_token
+            )
 
         logger.info("Match initialized successfully.")
 
@@ -434,7 +450,7 @@ class Match:
         )
         self._taxonomies[taxonomy.name] = taxonomy
 
-    def get_candidates_batch(self, texts: List[str], already_cleaned: bool = False) -> List[Tuple[int, str]]:
+    def get_candidates_batch(self, texts: List[str], already_cleaned: bool = False, rewrite: Optional[bool] = None,) -> List[Tuple[int, str]]:
         splitter = get_sentence_splitter(device=self.device)
         docs_segmented = splitter.split_two_pass(texts, already_cleaned=already_cleaned)
 
@@ -494,7 +510,44 @@ class Match:
             if pred["label"] in ("LABEL_1", "POSITIVE", "1") and pred["score"] >= 0.80:
                 filtered.append((doc_idx, sent))
 
-        return filtered
+        # Post-filter rewriter
+        use_canon = self.canonicalize if rewrite is None else rewrite
+        if not filtered or not use_canon:
+            return filtered
+
+        if self.rewriter is None and getattr(self, "rewriter_model_name", None):
+            self.rewriter = BatchedClauseRewriter(
+                self.rewriter_model_name,
+                device=self.device,
+                hf_token=self.hf_token
+            )
+        if self.rewriter is None:
+            return filtered
+
+        unique_filtered = list(dict.fromkeys(sent for _, sent in filtered))
+        rewritten_list = self.canonicalizer.canonicalize_batch(
+            unique_filtered,
+            batch_size=max(64, self.batch_size // 4),
+        )
+        raw_to_rew = dict(zip(unique_filtered, rewritten_list))
+
+        # Keep both original and rewritten
+        expanded: List[Tuple[int, str]] = []
+        seen_per_doc = set()
+        for doc_idx, orig_sent in filtered:
+            orig_key = (doc_idx, orig_sent.lower())
+            if orig_key not in seen_per_doc:
+                seen_per_doc.add(orig_key)
+                expanded.append((doc_idx, orig_sent))
+
+            rew_sent = filter_valid_sentence(raw_to_rew.get(orig_sent, ""), min_words=2, max_words=48)
+            if rew_sent:
+                rew_key = (doc_idx, rew_sent.lower())
+                if rew_key not in seen_per_doc:
+                    seen_per_doc.add(rew_key)
+                    expanded.append((doc_idx, rew_sent))
+
+        return expanded
 
     def _score_nli_entailment(
         self,
