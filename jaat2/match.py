@@ -164,7 +164,7 @@ class Match:
         self.rewriter: Optional[BatchedClauseRewriter] = None
 
         if self.rewrite and self.rewriter_model_name:
-            logger.info(f"Loading rewriter: {self.rewriter_model_name}...")
+            logger.info(f"Loading rewriter: {self.rewriter_model_name} on {self.device}...")
             self.rewriter = BatchedClauseRewriter(
                 self.rewriter_model_name,
                 device=self.device,

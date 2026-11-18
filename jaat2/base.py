@@ -271,7 +271,6 @@ class BatchedClauseRewriter:
 
         cache_key = f"rewrite_{model_name}"
         if cache_key not in MODEL_CACHE:
-            logger.info(f"Loading rewriter '{model_name}' on {self.device}...")
             use_bf16 = "cuda" in str(self.device) and torch.cuda.is_bf16_supported()
             tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token)
             model = AutoModelForSeq2SeqLM.from_pretrained(
@@ -279,6 +278,7 @@ class BatchedClauseRewriter:
                 token=hf_token,
                 dtype=torch.bfloat16 if use_bf16 else torch.float32,
             ).to(self.device)
+            model.generation_config.max_length = None
             model.eval()
             MODEL_CACHE[cache_key] = (tokenizer, model)
 
@@ -328,7 +328,7 @@ class BatchedClauseRewriter:
                 **inputs,
                 num_beams=num_beams,
                 max_new_tokens=max_new_tokens,
-                do_sample=False,
+                do_sample=False
             )
             decoded = self.tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
 
